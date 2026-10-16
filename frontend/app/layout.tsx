@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import SwarmCursor from '@/components/SwarmCursor';
+import { ThemeProvider } from "@/components/ThemeProvider";
 const geistSans = Geist({
   variable: "--font-geist-sans",
   subsets: ["latin"],
@@ -21,9 +22,19 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
     <html
       lang="en"
+            suppressHydrationWarning
+
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
       <body className="min-h-full flex flex-col dark">
+        <ThemeProvider
+  attribute="class"
+  defaultTheme="dark"
+  themes={["light","dark"]}
+  enableSystem
+  disableTransitionOnChange
+>
+
           <SwarmCursor
     count={1400}
     size={1.8}
@@ -32,6 +43,8 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
     clickEffect="pulse"
   >{children}
     </SwarmCursor>
+              </ThemeProvider>
+
   </body>
     </html>
   );
