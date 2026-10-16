@@ -46,6 +46,9 @@ class ResetResult(BaseModel):
 
 def _load_definition(config_path: str | Path) -> ServerDefinition:
     try:
+        inline = os.getenv("SERVER_CONFIG_JSON")
+        if inline:
+            return ServerDefinition.model_validate_json(inline)
         return ServerDefinition.model_validate_json(Path(config_path).read_text(encoding="utf-8"))
     except (OSError, ValidationError) as exc:
         raise RuntimeError(f"Unable to load simulated server configuration: {exc}") from exc

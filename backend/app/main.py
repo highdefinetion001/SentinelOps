@@ -24,10 +24,13 @@ from backend.app.core.ai_analysis import (
     AIAnalysisFailure,
     OpenAICompatibleAnalysisClient,
     build_drift_evidence,
+    build_local_demo_explanation,
 )
 from backend.app.core.detection import DriftDetector
 from backend.app.core.fingerprinting import fingerprint_state
 from backend.app.core.scheduler import collection_loop
+from backend.app.core.server_templates import load_server_templates, resolve_server_template
+from backend.app.provisioner import InternalProvisionRequest, InternalProvisionResponse
 from backend.app.schemas.ai_analysis import AIAnalysisRecord
 from backend.app.schemas.detection import DetectionScan
 from backend.app.schemas.fleet import (
@@ -49,11 +52,18 @@ from backend.app.schemas.persistence import (
     ServerInventoryList,
     ServerInventoryRecord,
 )
+from backend.app.schemas.provisioning import (
+    ProvisioningResult,
+    ProvisionServerRequest,
+    ServerTemplateList,
+)
 from backend.app.storage.sqlite import SQLiteDatabase
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 logger = logging.getLogger(__name__)
 AI_PROVIDER_ID = "openai_compatible"
+LOCAL_DEMO_PROVIDER_ID = "local_demo"
+LOCAL_DEMO_MODEL_ID = "predefined-template-v1"
 
 
 def _database_url() -> str:
@@ -76,6 +86,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         database.register_servers(registrations)
     application.state.database = database
     application.state.scan_lock = asyncio.Lock()
+    application.state.provision_locks = {}
     application.state.ai_analysis_tasks = {}
     scheduler_task: asyncio.Task[None] | None = None
     if _boolean_setting("MONITOR_SCHEDULER_ENABLED", default=True):
@@ -181,6 +192,27 @@ def get_fleet_collector() -> FleetCollector:
     return FleetCollector(
         {item.server_id: item.endpoint for item in registrations},
         registrations={item.server_id: item for item in registrations},
+    )
+
+
+def _collector_with_managed_servers(
+    collector: FleetCollector, database: SQLiteDatabase
+) -> FleetCollector:
+    registrations = dict(collector.registrations)
+    urls = dict(collector.server_urls)
+    for raw in database.list_managed_registrations():
+        try:
+            registration = ServerRegistration.model_validate(raw)
+        except ValidationError:
+            continue
+        if registration.server_id not in urls:
+            urls[registration.server_id] = registration.endpoint
+            registrations[registration.server_id] = registration
+    return FleetCollector(
+        urls,
+        registrations=registrations,
+        timeout=collector.timeout,
+        transport=collector.transport,
     )
 
 
@@ -333,12 +365,278 @@ async def readiness(
         raise _storage_error() from exc
 
 
+@app.get("/api/server-templates", response_model=ServerTemplateList)
+async def server_templates() -> ServerTemplateList:
+    try:
+        return ServerTemplateList(items=list(load_server_templates().values()))
+    except (RuntimeError, ValidationError) as exc:
+        raise HTTPException(status_code=503, detail="Server templates are unavailable") from exc
+
+
+def _provisioning_response(
+    request: ProvisionServerRequest, record: dict[str, object]
+) -> ProvisioningResult:
+    status = record.get("provisioning_status") or "provisioning"
+    if status not in {
+        "pending_baseline",
+        "provisioning",
+        "starting",
+        "healthy",
+        "registered",
+        "active",
+        "failed",
+        "unavailable",
+    }:
+        status = "provisioning"
+    health_status = record.get("health_status") or "unknown"
+    if health_status not in {"healthy", "unknown", "unhealthy"}:
+        health_status = "unknown"
+    return ProvisioningResult(
+        request_id=request.request_id,
+        server_id=request.server_id,
+        display_name=request.display_name,
+        role=request.role,
+        template_id=request.template_id,
+        status=status,
+        health_status=health_status,
+        container_name=record.get("container_name"),
+        baseline_status=(
+            "approved"
+            if record.get("current_baseline_id") is not None
+            else "pending_approval"
+            if status == "pending_baseline"
+            else "not_created"
+        ),
+        message=(
+            "Server is provisioned and awaiting explicit baseline approval."
+            if status == "pending_baseline"
+            else "This request is already being provisioned."
+        ),
+        error_step=record.get("error_step"),
+    )
+
+
+@app.post("/api/servers/provision", response_model=ProvisioningResult, status_code=201)
+async def provision_server(
+    request: ProvisionServerRequest,
+    database: Annotated[SQLiteDatabase, Depends(get_database)],
+    detector: Annotated[DriftDetector, Depends(get_drift_detector)],
+) -> ProvisioningResult:
+    locks = getattr(app.state, "provision_locks", None)
+    if locks is None:
+        locks = {}
+        app.state.provision_locks = locks
+    lock = locks.setdefault(request.server_id, asyncio.Lock())
+    async with lock:
+        return await _provision_server(request, database, detector)
+
+
+async def _provision_server(
+    request: ProvisionServerRequest,
+    database: SQLiteDatabase,
+    detector: DriftDetector,
+) -> ProvisioningResult:
+    try:
+        template = resolve_server_template(request.template_id, request.role)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(
+            status_code=422, detail="Template is not valid for the selected role"
+        ) from exc
+
+    endpoint = f"http://{request.server_id}:8080"
+    payload_hash_source = request.model_dump(mode="json")
+    try:
+        _, is_new = database.reserve_managed_server(
+            server_id=request.server_id,
+            display_name=request.display_name,
+            role=request.role,
+            endpoint=endpoint,
+            request_id=str(request.request_id),
+            request_payload=payload_hash_source,
+            template_id=template.template_id,
+            template_version=template.version,
+            description=request.description,
+            config=template.config.model_dump(mode="json"),
+        )
+        record = database.get_server(request.server_id)
+        operation = database.get_managed_operation(request.server_id)
+        if record is None or operation is None:
+            raise sqlite3.IntegrityError("managed server reservation disappeared")
+        if not is_new and operation["provisioning_status"] not in {
+            "provisioning",
+            "starting",
+            "healthy",
+            "registered",
+            "failed",
+        }:
+            return _provisioning_response(request, record)
+    except ValueError as exc:
+        if str(exc) == "server_id_conflict":
+            raise HTTPException(status_code=409, detail="Server ID is already registered") from exc
+        raise HTTPException(status_code=409, detail="Server could not be reserved") from exc
+    except sqlite3.Error as exc:
+        raise _storage_error() from exc
+
+    step = "container_provisioning"
+    provisioner_url = os.getenv("PROVISIONER_URL", "http://provisioner:8090").rstrip("/")
+    provisioner_attempted = False
+    try:
+        database.update_managed_server(
+            request.server_id, status="starting", health_status="unknown"
+        )
+        internal_request = InternalProvisionRequest(
+            request=request,
+            service=template.service,
+            config_version=template.config_version,
+            config=template.config,
+            environment=template.environment,
+        )
+        provisioner_attempted = True
+        response = await _create_server_via_provisioner(provisioner_url, internal_request)
+        if response.status_code != 201:
+            raise HTTPException(
+                status_code=502, detail="Provisioning service could not create the server"
+            )
+        provisioned = InternalProvisionResponse.model_validate(response.json())
+        database.update_managed_server(
+            request.server_id,
+            status="healthy",
+            health_status="healthy",
+            container_id=provisioned.container_id,
+            container_name=provisioned.container_name,
+        )
+
+        step = "identity_verification"
+        registration = ServerRegistration(
+            server_id=request.server_id,
+            display_name=request.display_name,
+            role=request.role,
+            endpoint=provisioned.endpoint,
+        )
+        statuses = database.register_servers([registration])
+        if statuses.get(request.server_id) == "identity_conflict":
+            raise HTTPException(
+                status_code=409, detail="New server identity conflicts with inventory"
+            )
+
+        step = "initial_collection"
+        collector = FleetCollector(
+            {request.server_id: provisioned.endpoint},
+            registrations={request.server_id: registration},
+        )
+        observed = await collector.collect_server(request.server_id)
+        if observed.status != "success" or observed.state is None:
+            raise HTTPException(
+                status_code=502, detail="New server did not return valid identity and state"
+            )
+        collection = FleetCollection(
+            collected_at=datetime.now(UTC),
+            status="complete",
+            total=1,
+            successful=1,
+            failed=0,
+            servers=[observed],
+        )
+        database.update_managed_server(
+            request.server_id,
+            status="registered",
+            health_status="healthy",
+            container_id=provisioned.container_id,
+            container_name=provisioned.container_name,
+        )
+        step = "baseline_candidate_creation"
+        states = database.reconcile_collection(
+            collection, policy_version=detector.policy.policy_version
+        )
+        if states.get(request.server_id) in {"identity_conflict", "decommissioned"}:
+            raise HTTPException(status_code=409, detail="Server identity cannot be enrolled")
+        database.create_candidate(
+            request.server_id,
+            observed.state,
+            created_by="sentinelops-provisioner",
+            reason=f"Initial enrollment using {template.template_id}",
+            policy_version=detector.policy.policy_version,
+        )
+        database.update_managed_server(
+            request.server_id,
+            status="pending_baseline",
+            health_status="healthy",
+            container_id=provisioned.container_id,
+            container_name=provisioned.container_name,
+        )
+        final = database.get_server(request.server_id)
+        assert final is not None
+        return _provisioning_response(request, final)
+    except HTTPException as exc:
+        safe_message = str(exc.detail) if isinstance(exc.detail, str) else "Provisioning failed"
+        if provisioner_attempted:
+            await _cleanup_provisioned_server(provisioner_url, request)
+        try:
+            database.update_managed_server(
+                request.server_id,
+                status="failed",
+                health_status="unhealthy",
+                error_step=step,
+                error_summary=safe_message,
+            )
+        except (KeyError, sqlite3.Error):
+            pass
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=f"Provisioning failed during {step}: {safe_message}",
+        ) from exc
+    except (httpx.HTTPError, ValidationError, sqlite3.Error, ValueError) as exc:
+        if provisioner_attempted:
+            await _cleanup_provisioned_server(provisioner_url, request)
+        try:
+            database.update_managed_server(
+                request.server_id,
+                status="failed",
+                health_status="unhealthy",
+                error_step=step,
+                error_summary=(
+                    "Provisioning failed; inspect Monitor readiness and the provisioning service."
+                ),
+            )
+        except (KeyError, sqlite3.Error):
+            pass
+        logger.warning("Dynamic server provisioning failed during %s", step)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Provisioning failed during {step}; the server was not enrolled",
+        ) from exc
+
+
+async def _cleanup_provisioned_server(base_url: str, request: ProvisionServerRequest) -> None:
+    try:
+        async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
+            await client.request(
+                "DELETE",
+                f"{base_url}/internal/servers/{request.server_id}",
+                json={"request_id": str(request.request_id)},
+            )
+    except httpx.HTTPError:
+        logger.warning("Provisioner cleanup could not be confirmed for a failed request")
+
+
+async def _create_server_via_provisioner(
+    base_url: str, request: InternalProvisionRequest
+) -> httpx.Response:
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(75.0, connect=2.0), trust_env=False
+    ) as client:
+        return await client.post(
+            f"{base_url}/internal/servers", json=request.model_dump(mode="json")
+        )
+
+
 @app.get("/api/fleet/states", response_model=FleetCollection)
 async def fleet_states(
     collector: Annotated[FleetCollector, Depends(get_fleet_collector)],
     database: Annotated[SQLiteDatabase, Depends(get_database)],
 ) -> FleetCollection:
     """Collect configured servers concurrently, returning partial outcomes when needed."""
+    collector = _collector_with_managed_servers(collector, database)
     collection = await collector.collect()
     try:
         collection = _include_unconfigured(
@@ -399,6 +697,7 @@ async def _execute_scan(
     application: FastAPI | None = None,
 ) -> DetectionScan:
     """Collect, reconcile, detect, and persist one scan with one resolved baseline set."""
+    collector = _collector_with_managed_servers(collector, database)
     started_at = datetime.now(UTC)
     collection = await collector.collect()
     try:
@@ -528,14 +827,39 @@ async def _complete_ai_analysis(scan: DetectionScan, database: SQLiteDatabase) -
         }
         evidence = build_drift_evidence(scan, server_roles=server_roles)
         model, explanation = await _ai_client_from_environment().analyze(evidence)
-        database.complete_ai_analysis(scan.scan_id, model=model, explanation=explanation)
+        database.complete_ai_analysis(
+            scan.scan_id, model=model, provider=AI_PROVIDER_ID, explanation=explanation
+        )
     except AIAnalysisFailure as exc:
         try:
-            database.fail_ai_analysis(scan.scan_id, error_summary=str(exc))
+            if _local_demo_fallback_enabled():
+                evidence = build_drift_evidence(
+                    scan,
+                    server_roles={
+                        server.server_id: (database.get_server(server.server_id) or {}).get("role")
+                        for server in scan.servers
+                        if server.outcome == "drifted"
+                    },
+                )
+                database.complete_ai_analysis(
+                    scan.scan_id,
+                    model=LOCAL_DEMO_MODEL_ID,
+                    provider=LOCAL_DEMO_PROVIDER_ID,
+                    explanation=build_local_demo_explanation(evidence),
+                )
+            else:
+                database.fail_ai_analysis(scan.scan_id, error_summary=str(exc))
         except sqlite3.Error:
             logger.warning("AI analysis failure status could not be persisted.")
     except sqlite3.Error:
         logger.warning("AI analysis could not read or update persistent scan data.")
+
+
+def _local_demo_fallback_enabled() -> bool:
+    try:
+        return _boolean_setting("AI_DEMO_FALLBACK", default=True)
+    except RuntimeError:
+        return False
 
 
 @app.get("/api/servers", response_model=ServerInventoryList)
@@ -633,7 +957,8 @@ async def create_baseline_candidate(
     detector: Annotated[DriftDetector, Depends(get_drift_detector)],
     database: Annotated[SQLiteDatabase, Depends(get_database)],
 ) -> BaselineRecord:
-    _server_url(server_id, configured_servers())
+    collector = _collector_with_managed_servers(collector, database)
+    _server_url(server_id, collector.server_urls)
     observed = await collector.collect_server(server_id)
     if observed.status != "success" or observed.state is None:
         raise HTTPException(
@@ -813,8 +1138,11 @@ async def simulate_fleet_drift(
     server_id: str,
     request: DriftRequest,
     client: Annotated[httpx.AsyncClient, Depends(get_upstream_client)],
+    collector: Annotated[FleetCollector, Depends(get_fleet_collector)],
+    database: Annotated[SQLiteDatabase, Depends(get_database)],
 ) -> DriftResponse:
-    registry = configured_servers()
+    collector = _collector_with_managed_servers(collector, database)
+    registry = collector.server_urls
     url = _server_url(server_id, registry)
     if not demo_controls_enabled():
         raise HTTPException(status_code=409, detail="Demo controls are disabled")
@@ -844,8 +1172,10 @@ async def reset_fleet_server(
     server_id: str,
     client: Annotated[httpx.AsyncClient, Depends(get_upstream_client)],
     collector: Annotated[FleetCollector, Depends(get_fleet_collector)],
+    database: Annotated[SQLiteDatabase, Depends(get_database)],
 ) -> ResetResponse:
-    registry = configured_servers()
+    collector = _collector_with_managed_servers(collector, database)
+    registry = collector.server_urls
     url = _server_url(server_id, registry)
     if not demo_controls_enabled():
         raise HTTPException(status_code=409, detail="Demo controls are disabled")

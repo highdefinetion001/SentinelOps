@@ -9,6 +9,50 @@ export type InventoryServer = {
   current_baseline_version: number | null;
   current_baseline_fingerprint: string | null;
   last_seen: string | null;
+  managed: boolean;
+  template_id: string | null;
+  template_version: string | null;
+  provisioning_status: string | null;
+  health_status: string | null;
+  error_step: string | null;
+  provisioning_error: string | null;
+  container_id: string | null;
+  container_name: string | null;
+  description: string | null;
+};
+
+export type ServerTemplate = {
+  template_id: "web-default-v1" | "application-default-v1" | "database-default-v1";
+  version: string;
+  role: "web" | "application" | "database";
+  service: string;
+  config_version: string;
+  config: Record<string, unknown>;
+  environment: Record<string, unknown>;
+};
+
+export type ProvisionServerRequest = {
+  request_id: string;
+  server_id: string;
+  display_name: string;
+  role: ServerTemplate["role"];
+  template_id: ServerTemplate["template_id"];
+  description?: string;
+  demo_mode: true;
+};
+
+export type ProvisioningResult = {
+  request_id: string;
+  server_id: string;
+  display_name: string;
+  role: ServerTemplate["role"];
+  template_id: ServerTemplate["template_id"];
+  status: string;
+  health_status: string;
+  container_name: string | null;
+  baseline_status: "pending_approval" | "approved" | "not_created";
+  message: string;
+  error_step: string | null;
 };
 
 export type Baseline = {
@@ -114,7 +158,14 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   });
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
-    const detail = payload && typeof payload.detail === "string" ? payload.detail : response.statusText;
+    const detail = typeof payload?.detail === "string"
+      ? payload.detail
+      : Array.isArray(payload?.detail)
+        ? payload.detail.map((item: { loc?: unknown[]; msg?: string }) => {
+          const field = item.loc?.slice(1).join(".");
+          return field ? `${field}: ${item.msg ?? "invalid value"}` : item.msg ?? "Invalid request";
+        }).join("; ")
+        : response.statusText;
     throw new Error(`${response.status}: ${detail || "Monitor request failed"}`);
   }
   return payload as T;

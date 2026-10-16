@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -27,9 +27,12 @@ import {
   type AIAnalysis,
   type Baseline,
   type InventoryServer,
+  type ProvisionServerRequest,
+  type ProvisioningResult,
   type Readiness,
   type Scan,
   type ScanSummary,
+  type ServerTemplate,
 } from "@/lib/api";
 
 type Health = { status: string; application: string; dependencies_checked: boolean };
@@ -50,6 +53,14 @@ const formatDate = (value?: string | null) => {
 };
 
 const shortHash = (value?: string | null) => (value ? `${value.slice(0, 12)}…${value.slice(-6)}` : "Not collected");
+
+function createRequestId(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
 
 function StatusPill({ value }: { value: string }) {
   return <span className={`status-pill status-${value.toLowerCase().replaceAll("_", "-")}`}>{value.replaceAll("_", " ")}</span>;
@@ -85,6 +96,15 @@ export default function Home() {
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState("");
   const [aiRefreshKey, setAiRefreshKey] = useState(0);
+  const [provisionFormOpen, setProvisionFormOpen] = useState(false);
+  const [templates, setTemplates] = useState<ServerTemplate[]>([]);
+  const [provisionRole, setProvisionRole] = useState<ServerTemplate["role"]>("web");
+  const [provisionTemplateId, setProvisionTemplateId] = useState<ServerTemplate["template_id"]>("web-default-v1");
+  const [provisionServerId, setProvisionServerId] = useState("");
+  const [provisionDisplayName, setProvisionDisplayName] = useState("");
+  const [provisionDescription, setProvisionDescription] = useState("");
+  const [provisioning, setProvisioning] = useState(false);
+  const [provisionRequestId, setProvisionRequestId] = useState("");
 
   const refresh = useCallback(async (quiet = false) => {
     if (!quiet) setLoading(true);
@@ -289,6 +309,107 @@ export default function Home() {
     }
   };
 
+  const openProvisionForm = async () => {
+    setError("");
+    setNotice("");
+    try {
+      const response = await api<{ items: ServerTemplate[] }>("/api/server-templates");
+      setTemplates(response.items);
+      setProvisionFormOpen(true);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Server templates could not be loaded");
+    }
+  };
+
+  const templatesForRole = templates.filter((template) => template.role === provisionRole);
+  const selectedTemplate = templatesForRole.find((template) => template.template_id === provisionTemplateId) ?? templatesForRole[0];
+
+  const createServer = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const serverId = provisionServerId.trim();
+    const displayName = provisionDisplayName.trim();
+    if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(serverId)) {
+      setError("Server ID must use lowercase letters, numbers, and single hyphens.");
+      return;
+    }
+    if (servers.some((server) => server.server_id === serverId)) {
+      setError("That server ID is already registered. Choose a unique ID.");
+      return;
+    }
+    if (!displayName || !/^[A-Za-z0-9][A-Za-z0-9 ._-]*$/.test(displayName)) {
+      setError("Enter a display name using letters, numbers, spaces, periods, underscores, or hyphens.");
+      return;
+    }
+    if (!selectedTemplate) {
+      setError("Choose a supported template for this server role.");
+      return;
+    }
+
+    const requestId = provisionRequestId || createRequestId();
+    setProvisionRequestId(requestId);
+    const body: ProvisionServerRequest = {
+      request_id: requestId,
+      server_id: serverId,
+      display_name: displayName,
+      role: provisionRole,
+      template_id: selectedTemplate.template_id,
+      description: provisionDescription.trim() || undefined,
+      demo_mode: true,
+    };
+    setProvisioning(true);
+    setBusy(true);
+    setError("");
+    setNotice(`Creating ${displayName}: reserving identity, starting its container, checking health, and collecting its initial state…`);
+    let requestPending = true;
+    void (async () => {
+      while (requestPending) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1800));
+        if (!requestPending) break;
+        try {
+          const server = await api<InventoryServer>(`/api/servers/${encodeURIComponent(serverId)}`);
+          if (!requestPending) break;
+          const status = server.provisioning_status ?? server.status;
+          const progress: Record<string, string> = {
+            provisioning: "The identity is reserved; the Provisioner is creating the server container…",
+            starting: "The server container was created and is starting…",
+            healthy: "Container health check passed; verifying server identity and collecting initial state…",
+            registered: "Initial state was collected; creating the pending baseline candidate…",
+            pending_baseline: "Server is ready. Its first baseline is pending your approval.",
+            failed: `Provisioning failed during ${server.error_step ?? "an unknown step"}: ${server.provisioning_error ?? "see Monitor logs"}`,
+            unavailable: "The server is registered but currently unreachable.",
+          };
+          setNotice(progress[status] ?? `Provisioning status: ${status}…`);
+        } catch {
+          if (requestPending) {
+            setNotice("Waiting for the Monitor to reserve this server ID and report provisioning progress…");
+          }
+        }
+      }
+    })();
+    try {
+      const result = await api<ProvisioningResult>("/api/servers/provision", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      requestPending = false;
+      setProvisionFormOpen(false);
+      setProvisionServerId("");
+      setProvisionDisplayName("");
+      setProvisionDescription("");
+      setProvisionRequestId("");
+      await refresh(true);
+      setNotice(`${result.display_name} is ${result.health_status}; its first configuration is Pending Approval. Approve it in Baseline enrollment before it is trusted.`);
+    } catch (reason) {
+      requestPending = false;
+      setNotice("");
+      await refresh(true);
+      setError(reason instanceof Error ? reason.message : "Server provisioning failed");
+    } finally {
+      setBusy(false);
+      setProvisioning(false);
+    }
+  };
+
   return (
     <main className="dashboard-shell">
       <header className="topbar">
@@ -323,11 +444,29 @@ export default function Home() {
         </section>
 
         <section className="section-card inventory-card">
-          <div className="section-heading"><div><div className="section-kicker">FLEET</div><h2>Server inventory</h2><p>Each server is compared with its own explicitly approved baseline.</p></div><span className="count-chip">{servers.length} servers</span></div>
+          <div className="section-heading"><div><div className="section-kicker">FLEET</div><h2>Server inventory</h2><p>Each server is compared with its own explicitly approved baseline.</p></div><div style={{ display: "flex", alignItems: "center", gap: 8 }}><span className="count-chip">{servers.length} servers</span><button className="primary-button" onClick={() => void openProvisionForm()} disabled={busy}><Server size={14} />Add server</button></div></div>
+          {provisionFormOpen && <form className="provision-form" onSubmit={(event) => void createServer(event)}>
+            <div className="candidate-top"><div><b>Add a simulated server</b><span>Creates a real private fleet container from a validated template.</span></div><button type="button" className="icon-button" onClick={() => setProvisionFormOpen(false)} disabled={provisioning} aria-label="Close form">×</button></div>
+            <div className="provision-fields">
+              <label>Server ID<input required pattern="[a-z0-9]+(-[a-z0-9]+)*" maxLength={63} value={provisionServerId} onChange={(event) => setProvisionServerId(event.target.value)} placeholder="checkout-worker-04" autoComplete="off" disabled={Boolean(provisionRequestId)} /></label>
+              <label>Display name<input required maxLength={128} value={provisionDisplayName} onChange={(event) => setProvisionDisplayName(event.target.value)} placeholder="Checkout Worker 04" disabled={Boolean(provisionRequestId)} /></label>
+              <label>Role<select value={provisionRole} onChange={(event) => {
+                const role = event.target.value as ServerTemplate["role"];
+                setProvisionRole(role);
+                const compatible = templates.find((template) => template.role === role);
+                if (compatible) setProvisionTemplateId(compatible.template_id);
+              }} disabled={Boolean(provisionRequestId)}><option value="web">Web server</option><option value="application">Application server</option><option value="database">Database server</option></select></label>
+              <label>Configuration template<select value={selectedTemplate?.template_id ?? ""} onChange={(event) => setProvisionTemplateId(event.target.value as ServerTemplate["template_id"])} disabled={Boolean(provisionRequestId)}>{templatesForRole.map((template) => <option key={template.template_id} value={template.template_id}>{template.template_id} · v{template.version}</option>)}</select></label>
+              <label className="provision-description">Description <span>(optional)</span><input maxLength={500} value={provisionDescription} onChange={(event) => setProvisionDescription(event.target.value)} placeholder="Purpose or owner note" disabled={Boolean(provisionRequestId)} /></label>
+            </div>
+            {selectedTemplate && <div className="provision-preview"><div><b>Configuration preview</b><span>Validated template · no credentials or user-supplied runtime settings</span></div><pre>{JSON.stringify({ service: selectedTemplate.service, config_version: selectedTemplate.config_version, config: selectedTemplate.config, environment: selectedTemplate.environment, demo_mode: true }, null, 2)}</pre></div>}
+            <div className="provision-actions"><span>First collection creates a pending candidate. Baseline approval stays explicit.</span><button className="primary-button" type="submit" disabled={busy || !selectedTemplate}>{provisioning ? <><RefreshCw size={14} className="spin" />Provisioning…</> : "Create server"}</button></div>
+          </form>}
           {loading && servers.length === 0 ? <div className="empty-state"><RefreshCw size={19} className="spin" />Loading server inventory…</div> : servers.length === 0 ? <div className="empty-state">No registered servers were returned by the Monitor.</div> : (
-            <div className="table-wrap"><table><thead><tr><th>SERVER</th><th>ROLE</th><th>ENROLLMENT</th><th>COLLECTION</th><th>BASELINE</th><th>OBSERVED FINGERPRINT</th></tr></thead><tbody>
+            <div className="table-wrap"><table><thead><tr><th>SERVER</th><th>ROLE</th><th>ENROLLMENT</th><th>COLLECTION</th><th>BASELINE</th><th>OBSERVED FINGERPRINT</th><th>DETAILS</th></tr></thead><tbody>
               {servers.map((server) => {
                 const collected = fleetById.get(server.server_id);
+                const assessment = activeScan?.servers.find((item) => item.server_id === server.server_id);
                 return <tr key={server.server_id}>
                   <td><div className="server-name"><span className="server-avatar"><Server size={15} /></span><span><b>{server.display_name}</b><small>{server.server_id}</small></span></div></td>
                   <td><span className="role-label">{server.role ?? "Unknown"}</span></td>
@@ -335,6 +474,7 @@ export default function Home() {
                   <td><StatusPill value={collected?.status === "success" ? "reachable" : collected?.status === "failed" ? "unreachable" : server.reachability} /></td>
                   <td>{server.current_baseline_version ? <span className="baseline-version">v{server.current_baseline_version}</span> : <span className="muted">Awaiting approval</span>}</td>
                   <td><span className="fingerprint"><Fingerprint size={13} />{shortHash(collected?.fingerprint)}</span></td>
+                  <td><details className="server-details"><summary>View</summary><div><span>Template <b>{server.template_id ? `${server.template_id} · v${server.template_version}` : "Compose-managed"}</b></span><span>Container <b>{server.container_name ?? "Managed by Compose"}</b></span><span>Health <b>{server.health_status ?? server.reachability}</b></span><span>Last scan <b>{assessment?.outcome ?? "Not assessed"}</b></span>{assessment?.findings.map((finding, index) => <span key={`${finding.evidence.field_path}-${index}`}>Finding <b>{finding.evidence.field_path} · {finding.assessment.severity}</b></span>)}{server.provisioning_error && <span className="provision-error">Provisioning failed at {server.error_step}: {server.provisioning_error}</span>}{server.description && <span>Description <b>{server.description}</b></span>}</div></details></td>
                 </tr>;
               })}
             </tbody></table></div>
@@ -408,7 +548,7 @@ export default function Home() {
               <article><h3>Prevention</h3>{visibleAiAnalysis.explanation.prevention.length ? <ul>{visibleAiAnalysis.explanation.prevention.map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}</ul> : <p className="muted">The provider did not return structured prevention steps.</p>}</article>
             </div>
           </>}
-          {(aiError || visibleAiAnalysis?.status === "failed") && <button className="retry-ai-button" disabled={aiLoading || busy} onClick={() => void retryAiAnalysis()}><RefreshCw size={14} />Retry AI analysis</button>}
+          {(aiError || visibleAiAnalysis?.status === "failed" || visibleAiAnalysis?.provider === "local_demo") && <button className="retry-ai-button" disabled={aiLoading || busy} onClick={() => void retryAiAnalysis()}><RefreshCw size={14} />{visibleAiAnalysis?.provider === "local_demo" ? "Try Ollama again" : "Retry AI analysis"}</button>}
           {visibleAiAnalysis?.status === "disabled" && <div className="ai-footnote">No request was sent to the AI provider. Configure AI_ENABLED=true to enable advisory analysis.</div>}
         </section>}
 

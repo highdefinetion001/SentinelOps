@@ -323,6 +323,7 @@ def test_failed_analysis_is_cached_until_explicit_retry(tmp_path, monkeypatch) -
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'retry-analysis.db'}")
     monkeypatch.setenv("MONITOR_SCHEDULER_ENABLED", "false")
     monkeypatch.setenv("AI_ENABLED", "true")
+    monkeypatch.setenv("AI_DEMO_FALLBACK", "false")
     scan = make_scan()
     calls = 0
 
@@ -361,6 +362,54 @@ def test_failed_analysis_is_cached_until_explicit_retry(tmp_path, monkeypatch) -
     assert retried.json()["status"] == "pending"
     assert result.json()["status"] == "completed"
     assert calls == 2
+
+
+def test_provider_failure_persists_an_explicitly_labeled_local_demo_explanation(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'local-demo.db'}")
+    monkeypatch.setenv("MONITOR_SCHEDULER_ENABLED", "false")
+    monkeypatch.setenv("AI_ENABLED", "true")
+    monkeypatch.setenv("AI_DEMO_FALLBACK", "true")
+    scan = make_scan()
+    attempts = 0
+
+    class UnavailableClient:
+        async def analyze(self, evidence):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise AIAnalysisFailure("AI provider could not be reached.")
+            return "ollama-qwen2.5:1.5b", AIExplanation(
+                summary="The model explained the detected debug setting change.",
+                impact="The policy marks this setting as critical in production.",
+                remediation=["Restore the approved debug setting."],
+                prevention=["Monitor this setting for future changes."],
+            )
+
+    monkeypatch.setattr("backend.app.main._ai_client_from_environment", lambda: UnavailableClient())
+    with TestClient(app) as client:
+        insert_scan(client.app.state.database, scan)
+        client.post(f"/api/scans/{scan.scan_id}/analysis")
+        for _ in range(100):
+            response = client.get(f"/api/scans/{scan.scan_id}/analysis")
+            if response.json()["status"] != "pending":
+                break
+            asyncio.run(asyncio.sleep(0.01))
+        assert response.json()["provider"] == "local_demo"
+        retry = client.post(f"/api/scans/{scan.scan_id}/analysis")
+        assert retry.json()["status"] == "pending"
+        for _ in range(100):
+            response = client.get(f"/api/scans/{scan.scan_id}/analysis")
+            if response.json()["status"] != "pending":
+                break
+            asyncio.run(asyncio.sleep(0.01))
+
+    record = response.json()
+    assert record["status"] == "completed"
+    assert record["provider"] == "openai_compatible"
+    assert record["model"] == "ollama-qwen2.5:1.5b"
+    assert "model explained" in record["explanation"]["summary"]
 
 
 def test_ai_analysis_storage_survives_reopen_and_returns_disabled_status(tmp_path) -> None:
@@ -421,11 +470,17 @@ def test_schema_v2_database_migrates_ai_analysis_table(tmp_path) -> None:
         connection.execute("PRAGMA user_version = 2")
     database.initialize()
     with database.connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         assert (
             connection.execute(
                 "SELECT name FROM sqlite_master WHERE name = 'ai_analyses'"
             ).fetchone()[0]
             == "ai_analyses"
+        )
+        assert (
+            connection.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'managed_servers'"
+            ).fetchone()[0]
+            == "managed_servers"
         )
     database.close()

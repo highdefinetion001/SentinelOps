@@ -21,6 +21,12 @@ class ServerInventoryRecord(FleetModel):
     reachability: Literal["unknown", "reachable", "unreachable", "not_configured"]
     status: Literal[
         "newly_enrolled",
+        "provisioning",
+        "starting",
+        "healthy",
+        "registered",
+        "failed",
+        "unavailable",
         "pending_baseline",
         "active",
         "unreachable",
@@ -35,6 +41,16 @@ class ServerInventoryRecord(FleetModel):
     current_baseline_version: int | None
     current_baseline_fingerprint: str | None
     decommissioned_at: datetime | None
+    managed: bool = False
+    template_id: str | None = None
+    template_version: str | None = None
+    provisioning_status: str | None = None
+    health_status: str | None = None
+    error_step: str | None = None
+    provisioning_error: str | None = None
+    container_id: str | None = None
+    container_name: str | None = None
+    description: str | None = None
 
 
 class ServerInventoryList(FleetModel):

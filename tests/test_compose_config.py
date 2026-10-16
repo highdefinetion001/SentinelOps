@@ -25,9 +25,13 @@ def test_compose_declares_monitor_and_three_private_role_servers() -> None:
     ]
     assert all(service["volumes"][0].endswith("/var/lib/configguard") for service in fleet_services)
     monitor = services["monitor"]
-    assert monitor["networks"] == ["monitoring", "api"]
-    assert set(monitor["depends_on"]) == {"server-01", "server-02", "server-03"}
-    assert all(item["condition"] == "service_started" for item in monitor["depends_on"].values())
+    assert monitor["networks"] == ["monitoring", "api", "ai", "provisioning"]
+    assert set(monitor["depends_on"]) == {"server-01", "server-02", "server-03", "provisioner"}
+    assert monitor["depends_on"]["provisioner"]["condition"] == "service_healthy"
+    assert all(
+        monitor["depends_on"][name]["condition"] == "service_started"
+        for name in ("server-01", "server-02", "server-03")
+    )
     assert monitor["healthcheck"]["test"][-1].endswith("/api/ready', timeout=2)")
     assert len(monitor["ports"]) == 1
     assert monitor["read_only"] is True
@@ -35,12 +39,27 @@ def test_compose_declares_monitor_and_three_private_role_servers() -> None:
     assert compose["networks"]["monitoring"]["driver"] == "bridge"
     assert compose["networks"]["monitoring"]["internal"] is True
     assert "monitoring" in monitor["networks"]
+    provisioner = services["provisioner"]
+    assert "ports" not in provisioner
+    assert provisioner["networks"] == ["provisioning", "docker_api"]
+    assert not any("docker.sock" in str(volume) for volume in provisioner.get("volumes", []))
+    assert "docker-api" in services
+    assert services["docker-api"]["networks"] == ["docker_api"]
+    assert services["docker-api"]["volumes"] == ["/var/run/docker.sock:/var/run/docker.sock:ro"]
+    assert not any("docker.sock" in str(volume) for volume in monitor.get("volumes", []))
+    assert len(services) == len(set(services))
     assert monitor["environment"]["DATABASE_URL"] == (
         "${DATABASE_URL:-sqlite:////data/configguard.db}"
     )
     assert "configguard_data:/data" in monitor["volumes"]
     assert monitor["environment"]["SERVER_REGISTRY_FILE"] == "/app/config/servers.json"
     assert monitor["environment"]["SCAN_INTERVAL_SECONDS"] == "${SCAN_INTERVAL_SECONDS:-60}"
+    assert monitor["environment"]["AI_BASE_URL"] == "${AI_BASE_URL:-http://ollama:11434/v1}"
+    ollama = services["ollama"]
+    assert ollama["profiles"] == ["ai"]
+    assert ollama["networks"] == ["ai"]
+    assert "ports" not in ollama
+    assert "ollama_models:/root/.ollama" in ollama["volumes"]
     assert "configguard_data" in compose["volumes"]
     assert "name" not in (compose["volumes"]["configguard_data"] or {})
 

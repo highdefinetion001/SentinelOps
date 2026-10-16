@@ -89,6 +89,42 @@ def build_drift_evidence(
     }
 
 
+def build_local_demo_explanation(evidence: dict[str, Any]) -> AIExplanation:
+    """Create a predefined, explicitly non-model explanation for demo availability."""
+    findings = [
+        item for server in evidence.get("servers", []) for item in server.get("findings", [])
+    ]
+    fields = sorted({str(item.get("field", "configuration")) for item in findings}) or [
+        "configuration"
+    ]
+    severities = {str(item.get("severity", "INFO")) for item in findings}
+    field_summary = ", ".join(fields[:4])
+    if len(fields) > 4:
+        field_summary += f", and {len(fields) - 4} more"
+    high_impact = bool(severities & {"HIGH", "CRITICAL"})
+    return AIExplanation(
+        summary=(
+            f"Demonstration template: deterministic drift was detected in {field_summary}. "
+            "This text was generated locally because the configured AI provider was unavailable."
+        ),
+        impact=(
+            "Review the recorded values and deployment context. At least one finding has "
+            "a HIGH or CRITICAL policy severity; that severity comes from deterministic "
+            "policy evaluation, not this template."
+            if high_impact
+            else "The operational impact depends on the service and deployment context; "
+            "this local template does not infer a cause or security incident."
+        ),
+        remediation=[
+            f"Review the finding for {field} against the approved baseline." for field in fields[:3]
+        ],
+        prevention=[
+            "After an authorized change, approve a new baseline through the Monitor workflow.",
+            "Keep deterministic policy checks enabled and investigate repeated drift.",
+        ],
+    )
+
+
 def _safe_evidence_value(evidence: EvidenceValue) -> bool | int | float | str | None:
     if evidence.state == "missing":
         return "(missing)"

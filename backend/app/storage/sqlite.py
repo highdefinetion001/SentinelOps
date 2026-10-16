@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -23,7 +24,7 @@ from backend.app.schemas.server_state import ServerStateV1
 if TYPE_CHECKING:
     from backend.app.config.registry import ServerRegistration
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def utc_text(value: datetime | None = None) -> str:
@@ -124,6 +125,9 @@ class SQLiteDatabase:
                 if version == 2:
                     connection.execute(_AI_ANALYSES_TABLE)
                     version = 3
+                if version == 3:
+                    connection.execute(_MANAGED_SERVERS_TABLE)
+                    version = 4
                 connection.execute(f"PRAGMA user_version = {version}")
                 connection.commit()
             except BaseException:
@@ -179,6 +183,133 @@ class SQLiteDatabase:
                 )
                 statuses[server_id] = row["lifecycle_status"]
         return statuses
+
+    def reserve_managed_server(
+        self,
+        *,
+        server_id: str,
+        display_name: str,
+        role: str,
+        endpoint: str,
+        request_id: str,
+        request_payload: dict[str, Any],
+        template_id: str,
+        template_version: str,
+        description: str | None,
+        config: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        """Reserve a unique identity and return (record, is_new) transactionally."""
+        now = utc_text()
+        request_hash = hashlib.sha256(_json(request_payload).encode()).hexdigest()
+        with self.transaction() as connection:
+            existing = connection.execute(
+                """SELECT m.*, s.endpoint, s.server_type FROM managed_servers m
+                    JOIN servers s ON s.server_id = m.server_id WHERE m.server_id = ?""",
+                (server_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["request_id"] == request_id
+                    and existing["request_hash"] == request_hash
+                ):
+                    if existing["provisioning_status"] == "failed":
+                        connection.execute(
+                            """UPDATE managed_servers SET provisioning_status = 'provisioning',
+                                error_step = NULL, error_summary = NULL, updated_at = ?
+                                WHERE server_id = ?""",
+                            (now, server_id),
+                        )
+                    return dict(existing), False
+                raise ValueError("server_id_conflict")
+            static = connection.execute(
+                "SELECT 1 FROM servers WHERE server_id = ?", (server_id,)
+            ).fetchone()
+            if static is not None:
+                raise ValueError("server_id_conflict")
+            connection.execute(
+                """INSERT INTO servers (
+                    server_id, display_name, role, server_type, endpoint,
+                    lifecycle_status, reachability, first_seen
+                ) VALUES (?, ?, NULL, ?, ?, 'newly_enrolled', 'unknown', ?)""",
+                (server_id, display_name, role, endpoint, now),
+            )
+            connection.execute(
+                """INSERT INTO managed_servers (
+                    server_id, request_id, request_hash, template_id, template_version,
+                    description, config_json, provisioning_status, health_status,
+                    error_step, error_summary, container_id, container_name, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'provisioning', 'unknown', NULL, NULL,
+                    NULL, NULL, ?, ?)""",
+                (
+                    server_id,
+                    request_id,
+                    request_hash,
+                    template_id,
+                    template_version,
+                    description,
+                    _json(config),
+                    now,
+                    now,
+                ),
+            )
+        record = self.get_server(server_id)
+        assert record is not None
+        return record, True
+
+    def update_managed_server(
+        self,
+        server_id: str,
+        *,
+        status: str,
+        health_status: str,
+        container_id: str | None = None,
+        container_name: str | None = None,
+        error_step: str | None = None,
+        error_summary: str | None = None,
+    ) -> None:
+        if status not in {
+            "provisioning",
+            "starting",
+            "healthy",
+            "registered",
+            "pending_baseline",
+            "active",
+            "failed",
+            "unavailable",
+            "decommissioned",
+        }:
+            raise ValueError("invalid_provisioning_status")
+        if health_status not in {"unknown", "healthy", "unhealthy"}:
+            raise ValueError("invalid_health_status")
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE managed_servers SET provisioning_status = ?, health_status = ?,
+                    container_id = COALESCE(?, container_id),
+                    container_name = COALESCE(?, container_name),
+                    error_step = ?, error_summary = ?, updated_at = ? WHERE server_id = ?""",
+                (
+                    status,
+                    health_status,
+                    container_id,
+                    container_name,
+                    error_step,
+                    error_summary[:500] if error_summary else None,
+                    utc_text(),
+                    server_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError("managed_server_not_found")
+
+    def list_managed_registrations(self) -> list[dict[str, str]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                """SELECT s.server_id, s.display_name, s.server_type AS role, s.endpoint
+                    FROM servers s JOIN managed_servers m ON m.server_id = s.server_id
+                    WHERE s.lifecycle_status != 'decommissioned'
+                    AND m.provisioning_status != 'failed' ORDER BY s.server_id"""
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def reconcile_collection(
         self, collection: FleetCollection, *, policy_version: str = "1.0"
@@ -315,6 +446,23 @@ class SQLiteDatabase:
                             "UPDATE servers SET lifecycle_status = ? WHERE server_id = ?",
                             (lifecycle, result.server_id),
                         )
+                managed_status = (
+                    "active"
+                    if state and row is not None and row["current_baseline_id"]
+                    else "pending_baseline"
+                    if state
+                    else "unavailable"
+                )
+                connection.execute(
+                    """UPDATE managed_servers SET provisioning_status = ?, health_status = ?,
+                        updated_at = ? WHERE server_id = ?""",
+                    (
+                        managed_status,
+                        "healthy" if state else "unhealthy",
+                        utc_text(),
+                        result.server_id,
+                    ),
+                )
                 states[result.server_id] = lifecycle
         return states
 
@@ -511,14 +659,30 @@ class SQLiteDatabase:
                 if row is None:
                     raise KeyError("server_not_found")
                 raise ValueError("server_decommissioned")
+            connection.execute(
+                "UPDATE managed_servers SET provisioning_status = 'decommissioned', "
+                "updated_at = ? WHERE server_id = ?",
+                (timestamp, server_id),
+            )
         return self.get_server(server_id) or {}
+
+    def get_managed_operation(self, server_id: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM managed_servers WHERE server_id = ?", (server_id,)
+            ).fetchone()
+        return dict(row) if row else None
 
     def get_server(self, server_id: str) -> dict[str, Any] | None:
         with self.connection() as connection:
             row = connection.execute(
                 """SELECT s.*, b.version AS current_baseline_version,
-                    b.fingerprint AS current_baseline_fingerprint
+                    b.fingerprint AS current_baseline_fingerprint,
+                    m.template_id, m.template_version, m.provisioning_status,
+                    m.health_status, m.error_step, m.error_summary AS provisioning_error,
+                    m.container_id, m.container_name, m.description
                     FROM servers s LEFT JOIN baselines b ON b.baseline_id = s.current_baseline_id
+                    LEFT JOIN managed_servers m ON m.server_id = s.server_id
                     WHERE s.server_id = ?""",
                 (server_id,),
             ).fetchone()
@@ -528,8 +692,12 @@ class SQLiteDatabase:
         with self.connection() as connection:
             rows = connection.execute(
                 """SELECT s.*, b.version AS current_baseline_version,
-                    b.fingerprint AS current_baseline_fingerprint
+                    b.fingerprint AS current_baseline_fingerprint,
+                    m.template_id, m.template_version, m.provisioning_status,
+                    m.health_status, m.error_step, m.error_summary AS provisioning_error,
+                    m.container_id, m.container_name, m.description
                     FROM servers s LEFT JOIN baselines b ON b.baseline_id = s.current_baseline_id
+                    LEFT JOIN managed_servers m ON m.server_id = s.server_id
                     ORDER BY s.server_id LIMIT ? OFFSET ?""",
                 (limit, offset),
             ).fetchall()
@@ -737,7 +905,14 @@ class SQLiteDatabase:
                         error,
                     ),
                 )
-            elif explicit_retry and enabled and row["status"] in {"failed", "disabled"}:
+            elif (
+                explicit_retry
+                and enabled
+                and (
+                    row["status"] in {"failed", "disabled"}
+                    or (row["status"] == "completed" and row["provider"] == "local_demo")
+                )
+            ):
                 connection.execute(
                     """UPDATE ai_analyses SET status = 'pending', model = ?,
                         explanation_json = NULL, error_summary = NULL, updated_at = ?
@@ -762,13 +937,21 @@ class SQLiteDatabase:
             ).fetchone()
         return _ai_analysis_record(row) if row else None
 
-    def complete_ai_analysis(self, scan_id: str, *, model: str, explanation: AIExplanation) -> None:
+    def complete_ai_analysis(
+        self,
+        scan_id: str,
+        *,
+        model: str,
+        explanation: AIExplanation,
+        provider: str | None = None,
+    ) -> None:
         with self.transaction() as connection:
             connection.execute(
                 """UPDATE ai_analyses SET status = 'completed', model = ?,
-                    explanation_json = ?, error_summary = NULL, updated_at = ?
+                    provider = COALESCE(?, provider), explanation_json = ?,
+                    error_summary = NULL, updated_at = ?
                     WHERE scan_id = ? AND status = 'pending'""",
-                (model, explanation.model_dump_json(), utc_text(), scan_id),
+                (model, provider, explanation.model_dump_json(), utc_text(), scan_id),
             )
 
     def fail_ai_analysis(self, scan_id: str, *, error_summary: str) -> None:
@@ -801,6 +984,7 @@ def _server_record(row: sqlite3.Row) -> dict[str, Any]:
     result = dict(row)
     result.pop("endpoint", None)
     result.pop("instance_id", None)
+    result["managed"] = result.get("template_id") is not None
     for name in ("first_seen", "last_seen", "last_attempt", "decommissioned_at"):
         result[name] = _parse_time(result[name])
     result["status"] = _public_server_status(result)
@@ -812,6 +996,14 @@ def _public_server_status(server: dict[str, Any]) -> str:
         return "decommissioned"
     if server["lifecycle_status"] == "identity_conflict":
         return "identity_conflict"
+    if server.get("provisioning_status") in {
+        "provisioning",
+        "starting",
+        "healthy",
+        "failed",
+        "unavailable",
+    }:
+        return server["provisioning_status"]
     if server["reachability"] == "not_configured":
         return "not_configured"
     if server["reachability"] == "unreachable":
@@ -868,6 +1060,26 @@ _AI_ANALYSES_TABLE = """CREATE TABLE IF NOT EXISTS ai_analyses (
     error_summary TEXT,
     CHECK ((status = 'completed' AND explanation_json IS NOT NULL)
         OR (status != 'completed' AND explanation_json IS NULL))
+)"""
+
+_MANAGED_SERVERS_TABLE = """CREATE TABLE IF NOT EXISTS managed_servers (
+    server_id TEXT PRIMARY KEY REFERENCES servers(server_id),
+    request_id TEXT NOT NULL UNIQUE,
+    request_hash TEXT NOT NULL,
+    template_id TEXT NOT NULL,
+    template_version TEXT NOT NULL,
+    description TEXT,
+    config_json TEXT NOT NULL,
+    provisioning_status TEXT NOT NULL CHECK (provisioning_status IN (
+        'provisioning', 'starting', 'healthy', 'registered', 'pending_baseline',
+        'active', 'failed', 'unavailable', 'decommissioned')),
+    health_status TEXT NOT NULL CHECK (health_status IN ('unknown', 'healthy', 'unhealthy')),
+    error_step TEXT,
+    error_summary TEXT,
+    container_id TEXT,
+    container_name TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 )"""
 
 
@@ -944,6 +1156,7 @@ _SCHEMA = (
     )""",
     "CREATE INDEX scan_servers_server ON scan_servers(server_id, scan_id)",
     _AI_ANALYSES_TABLE,
+    _MANAGED_SERVERS_TABLE,
 )
 
 

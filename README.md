@@ -8,7 +8,8 @@ Requirements: Python 3.11–3.12 for local development, Docker Engine, and Docke
 
 ```bash
 cp -n .env.example .env
-docker compose up --build -d --wait
+docker compose --profile ai up --build -d --wait
+docker compose exec ollama ollama pull qwen2.5:1.5b
 ```
 
 The Monitor listens on `http://localhost:8000`. The simulated servers have no published host ports. `DEMO_MODE=true` in the example `.env` enables the predefined demo drift and reset actions. Set it to `false` and recreate the services to disable them. SQLite data lives in the existing named `configguard_data` volume and survives container recreation and `docker compose down`; `docker compose down -v` removes the current Compose project's volumes.
@@ -27,7 +28,9 @@ The supplied actor is audit metadata only; this project does not yet authenticat
 
 Each server has its own named identity volume. The collector instance ID remains stable across a server restart; replacing the volume creates a different identity and the Monitor marks the mismatch instead of attaching the old baseline. The state endpoint returns only the versioned configuration contract. Collector identity, role, display name, and collector version travel in response headers and are checked against the declared registry. Collector endpoints are reachable only on the private Compose network. There is no per-caller collector authentication in this MVP: treat every workload attached to that network as trusted, and do not attach untrusted services or publish collector ports. Demo controls are separate allowlisted POST routes, disabled when `DEMO_MODE=false`.
 
-To add a server, add its declaration to `config/servers.json`, add its Compose service and a unique identity volume, then recreate the Monitor and new server. It enters the pending-baseline workflow after a successful collection. Before removing a server, call `POST /api/servers/{server_id}/decommission`; removing its registry entry without decommissioning leaves its inventory and history visible as not configured. A changed role or endpoint for an existing ID becomes an identity conflict; enroll a replacement under a new ID rather than reusing its baseline.
+Use **Add server** in the dashboard to create a simulated server without editing Compose or `config/servers.json`. The Monitor validates a unique lowercase server ID, role, and versioned role template, then sends the fixed request to the isolated Provisioner. The Provisioner creates only the built-in fleet image on the project's private monitoring network, with a persistent identity volume, fixed resource limits, a health check, and no published port. A Docker socket proxy is the only component that mounts the host socket; neither Monitor nor server containers receive it. Docker Engine access is required for this workflow. New registrations and template metadata persist in SQLite and are recollected after Monitor restarts; a missing container is reported unavailable and is never replaced automatically. Successful first collection creates a **pending** candidate. Approve it explicitly in **Baseline enrollment** before it is trusted. Provisioning and baseline approval are demo/admin operations without real authentication.
+
+The built-in templates use only fields in the current server-state contract (`debug_mode`, `max_connections`, `log_level`, `tls_min_version`, and runtime/app versions); they contain no credentials or user-defined container settings. The current API does not expose a server removal action. Decommission a server using `POST /api/servers/{server_id}/decommission` to preserve inventory and history; do not manually delete its dynamic identity volume if you need that server's history or identity continuity. A changed role, endpoint, or instance identity becomes an identity conflict; enroll a replacement under a new ID rather than reusing its baseline.
 
 ## Tests and local API
 
@@ -46,7 +49,9 @@ The Docker integration smoke test runs automatically when Docker Engine is reach
 
 ## Advisory AI drift analysis
 
-Set `AI_ENABLED=true`, `AI_BASE_URL`, optional `AI_API_KEY`, optional `AI_MODEL`, and `AI_TIMEOUT_SECONDS` in the ignored local `.env` before starting Compose. The Monitor sends only allowlisted fields from deterministic drift findings to the OpenAI-compatible provider; it does not send full server snapshots. If `AI_MODEL` is empty, it selects a model only when `/models` returns exactly one model ID. AI explanations are stored per scan and can be retrieved or retried through `GET` or `POST /api/scans/{scan_id}/analysis`. A provider failure leaves the saved scan and its deterministic severity unchanged. AI text is advisory and never applies remediation. Provider connectivity and model availability must be verified in the actual deployment; a configured URL alone does not mean AI is available.
+Compose can run Ollama with the `ai` profile on a private AI network and stores downloaded models in the `ollama_models` named volume. Start with `docker compose --profile ai up --build -d --wait`, then pull `qwen2.5:1.5b` (about 986 MB) with `docker compose exec ollama ollama pull qwen2.5:1.5b`. Ollama has no host-published port and is not attached to the simulated-server network. To switch models, update `AI_MODEL` in `.env`, pull that model through the Ollama container, and recreate the Monitor. If a drift scan was analyzed while the model was downloading, use **Try Ollama again** after the pull completes.
+
+The Monitor sends only allowlisted fields from deterministic drift findings to Ollama's OpenAI-compatible API; it does not send full server snapshots. AI explanations are stored per scan and can be retrieved or retried through `GET` or `POST /api/scans/{scan_id}/analysis`. With `AI_DEMO_FALLBACK=true`, a provider failure produces a clearly labeled local template for demonstrations; it is not generated by a model. Set it to `false` to show provider failures instead. AI text is advisory and never applies remediation.
 
 ## Demonstration workflow
 
@@ -74,15 +79,16 @@ SentinelOps/
 │       ├── config/          Baseline and policy loaders
 │       ├── core/            Fingerprinting and deterministic drift detection
 │       ├── schemas/         Pydantic request, state and scan contracts
+│       ├── provisioner.py   Isolated fixed-template Docker provisioning API
 │       └── storage/         Versioned SQLite inventory, baselines and scan history
-├── config/                  JSON Schema, approved baseline and YAML policy
+├── config/                  JSON Schema, baseline, policy and safe server templates
 ├── fleet/                   Simulated server container and per-server configs
 ├── frontend/                Next.js dashboard and same-origin API client
 │   ├── app/                 Live fleet dashboard and styling
 │   ├── lib/api.ts           Validated endpoint calls and response types
 │   └── next.config.ts       Development API proxy to the Monitor
 ├── tests/                    Backend contract, API, detector and fleet tests
-├── docker-compose.yml        Monitor, three server roles, private network and volumes
+├── docker-compose.yml        Monitor, fleet, Provisioner, socket proxy, networks and volumes
 ├── pyproject.toml            Python dependencies and tool configuration
 └── README.md                 Setup, validation and run instructions
 ```

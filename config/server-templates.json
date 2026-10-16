@@ -1,0 +1,46 @@
+{
+  "templates": [
+    {
+      "template_id": "web-default-v1",
+      "version": "1",
+      "role": "web",
+      "service": "checkout-web",
+      "config_version": "template-v1",
+      "config": {
+        "debug_mode": false,
+        "max_connections": 150,
+        "log_level": "INFO",
+        "tls_min_version": "TLS1.3"
+      },
+      "environment": {"runtime_version": "3.12", "app_version": "1.4.0"}
+    },
+    {
+      "template_id": "application-default-v1",
+      "version": "1",
+      "role": "application",
+      "service": "checkout-application",
+      "config_version": "template-v1",
+      "config": {
+        "debug_mode": false,
+        "max_connections": 200,
+        "log_level": "INFO",
+        "tls_min_version": "TLS1.2"
+      },
+      "environment": {"runtime_version": "3.12", "app_version": "1.4.0"}
+    },
+    {
+      "template_id": "database-default-v1",
+      "version": "1",
+      "role": "database",
+      "service": "checkout-database",
+      "config_version": "template-v1",
+      "config": {
+        "debug_mode": false,
+        "max_connections": 500,
+        "log_level": "WARNING",
+        "tls_min_version": "TLS1.3"
+      },
+      "environment": {"runtime_version": "3.12", "app_version": "1.4.0"}
+    }
+  ]
+}
