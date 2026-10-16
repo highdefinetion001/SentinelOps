@@ -1,6 +1,7 @@
 """FastAPI application for health, fleet collection, and safe demo controls."""
 
 import asyncio
+import logging
 import os
 import sqlite3
 from collections.abc import AsyncIterator
@@ -19,9 +20,15 @@ from backend.app.collector.fleet import DEFAULT_FLEET_SERVERS, FleetCollector, p
 from backend.app.config.baseline import load_baseline
 from backend.app.config.policy import load_policy
 from backend.app.config.registry import ServerRegistration, load_server_registry
+from backend.app.core.ai_analysis import (
+    AIAnalysisFailure,
+    OpenAICompatibleAnalysisClient,
+    build_drift_evidence,
+)
 from backend.app.core.detection import DriftDetector
 from backend.app.core.fingerprinting import fingerprint_state
 from backend.app.core.scheduler import collection_loop
+from backend.app.schemas.ai_analysis import AIAnalysisRecord
 from backend.app.schemas.detection import DetectionScan
 from backend.app.schemas.fleet import (
     DriftRequest,
@@ -45,6 +52,8 @@ from backend.app.schemas.persistence import (
 from backend.app.storage.sqlite import SQLiteDatabase
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+logger = logging.getLogger(__name__)
+AI_PROVIDER_ID = "openai_compatible"
 
 
 def _database_url() -> str:
@@ -67,6 +76,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         database.register_servers(registrations)
     application.state.database = database
     application.state.scan_lock = asyncio.Lock()
+    application.state.ai_analysis_tasks = {}
     scheduler_task: asyncio.Task[None] | None = None
     if _boolean_setting("MONITOR_SCHEDULER_ENABLED", default=True):
         worker_count = int(os.getenv("WEB_CONCURRENCY", "1"))
@@ -85,6 +95,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
                     get_drift_detector(),
                     database,
                     idempotency_key=None,
+                    application=application,
                 )
 
         scheduler_task = asyncio.create_task(
@@ -96,6 +107,11 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         if scheduler_task is not None:
             scheduler_task.cancel()
             await asyncio.gather(scheduler_task, return_exceptions=True)
+        analysis_tasks = list(application.state.ai_analysis_tasks.values())
+        for task in analysis_tasks:
+            task.cancel()
+        if analysis_tasks:
+            await asyncio.gather(*analysis_tasks, return_exceptions=True)
         database.close()
 
 
@@ -365,7 +381,13 @@ async def run_detection_scan(
                 raise _storage_error() from exc
             if previous:
                 return previous["result"]
-        return await _execute_scan(collector, detector, database, idempotency_key=idempotency_key)
+        return await _execute_scan(
+            collector,
+            detector,
+            database,
+            idempotency_key=idempotency_key,
+            application=request.app,
+        )
 
 
 async def _execute_scan(
@@ -374,6 +396,7 @@ async def _execute_scan(
     database: SQLiteDatabase,
     *,
     idempotency_key: str | None,
+    application: FastAPI | None = None,
 ) -> DetectionScan:
     """Collect, reconcile, detect, and persist one scan with one resolved baseline set."""
     started_at = datetime.now(UTC)
@@ -410,9 +433,109 @@ async def _execute_scan(
             previous = database.get_scan(stored_scan_id)
             if previous:
                 return previous["result"]
+        if _scan_has_ai_evidence(scan):
+            try:
+                _ensure_scan_analysis(scan, database, application)
+            except sqlite3.Error:
+                logger.warning("AI analysis status could not be persisted for a completed scan.")
     except sqlite3.Error as exc:
         raise _storage_error() from exc
     return scan
+
+
+def _ai_is_enabled() -> bool:
+    try:
+        return _boolean_setting("AI_ENABLED", default=False)
+    except RuntimeError:
+        return False
+
+
+def _configured_ai_model() -> str | None:
+    return os.getenv("AI_MODEL", "").strip() or None
+
+
+def _scan_has_ai_evidence(scan: DetectionScan) -> bool:
+    return any(
+        server.outcome == "drifted"
+        and server.baseline_drift_detected is True
+        and bool(server.findings)
+        for server in scan.servers
+    )
+
+
+def _ensure_scan_analysis(
+    scan: DetectionScan,
+    database: SQLiteDatabase,
+    application: FastAPI | None,
+    *,
+    explicit_retry: bool = False,
+) -> AIAnalysisRecord:
+    drifted_server_ids = [
+        server.server_id
+        for server in scan.servers
+        if server.outcome == "drifted"
+        and server.baseline_drift_detected is True
+        and server.findings
+    ]
+    record = database.create_or_retry_ai_analysis(
+        scan.scan_id,
+        enabled=_ai_is_enabled(),
+        provider=AI_PROVIDER_ID,
+        model=_configured_ai_model(),
+        server_ids=drifted_server_ids,
+        explicit_retry=explicit_retry,
+    )
+    if _ai_is_enabled() and record.status == "pending" and application is not None:
+        _start_ai_analysis(application, scan, database)
+    return record
+
+
+def _start_ai_analysis(application: FastAPI, scan: DetectionScan, database: SQLiteDatabase) -> None:
+    tasks: dict[str, asyncio.Task[None]] = application.state.ai_analysis_tasks
+    current = tasks.get(scan.scan_id)
+    if current is not None and not current.done():
+        return
+    task = asyncio.create_task(
+        _complete_ai_analysis(scan, database), name=f"ai-analysis-{scan.scan_id}"
+    )
+    tasks[scan.scan_id] = task
+    task.add_done_callback(lambda completed: tasks.pop(scan.scan_id, None))
+
+
+def _ai_client_from_environment() -> OpenAICompatibleAnalysisClient:
+    try:
+        timeout = float(os.getenv("AI_TIMEOUT_SECONDS", "20"))
+        return OpenAICompatibleAnalysisClient(
+            base_url=os.getenv(
+                "AI_BASE_URL", "https://caused-camps-consortium-midi.trycloudflare.com/v1"
+            ),
+            api_key=os.getenv("AI_API_KEY", ""),
+            model=os.getenv("AI_MODEL", ""),
+            timeout_seconds=timeout,
+        )
+    except (ValueError, AIAnalysisFailure) as exc:
+        if isinstance(exc, AIAnalysisFailure):
+            raise
+        raise AIAnalysisFailure("AI configuration is invalid.") from exc
+
+
+async def _complete_ai_analysis(scan: DetectionScan, database: SQLiteDatabase) -> None:
+    try:
+        server_roles = {
+            server.server_id: (database.get_server(server.server_id) or {}).get("role")
+            for server in scan.servers
+            if server.outcome == "drifted"
+        }
+        evidence = build_drift_evidence(scan, server_roles=server_roles)
+        model, explanation = await _ai_client_from_environment().analyze(evidence)
+        database.complete_ai_analysis(scan.scan_id, model=model, explanation=explanation)
+    except AIAnalysisFailure as exc:
+        try:
+            database.fail_ai_analysis(scan.scan_id, error_summary=str(exc))
+        except sqlite3.Error:
+            logger.warning("AI analysis failure status could not be persisted.")
+    except sqlite3.Error:
+        logger.warning("AI analysis could not read or update persistent scan data.")
 
 
 @app.get("/api/servers", response_model=ServerInventoryList)
@@ -643,6 +766,44 @@ async def scan_detail(
         if record is None:
             raise HTTPException(status_code=404, detail="Unknown scan")
         return ScanDetail.model_validate(record)
+    except sqlite3.Error as exc:
+        raise _storage_error() from exc
+
+
+@app.get("/api/scans/{scan_id}/analysis", response_model=AIAnalysisRecord)
+async def scan_ai_analysis(
+    scan_id: UUID,
+    request: Request,
+    database: Annotated[SQLiteDatabase, Depends(get_database)],
+) -> AIAnalysisRecord:
+    """Retrieve a cached explanation, scheduling one for an older drift scan if needed."""
+    try:
+        stored = database.get_scan(str(scan_id))
+        if stored is None:
+            raise HTTPException(status_code=404, detail="Unknown scan")
+        scan = stored["result"]
+        if not _scan_has_ai_evidence(scan):
+            raise HTTPException(status_code=409, detail="This scan has no eligible drift findings")
+        return _ensure_scan_analysis(scan, database, request.app)
+    except sqlite3.Error as exc:
+        raise _storage_error() from exc
+
+
+@app.post("/api/scans/{scan_id}/analysis", response_model=AIAnalysisRecord)
+async def request_scan_ai_analysis(
+    scan_id: UUID,
+    request: Request,
+    database: Annotated[SQLiteDatabase, Depends(get_database)],
+) -> AIAnalysisRecord:
+    """Request or retry advisory analysis without changing the deterministic scan."""
+    try:
+        stored = database.get_scan(str(scan_id))
+        if stored is None:
+            raise HTTPException(status_code=404, detail="Unknown scan")
+        scan = stored["result"]
+        if not _scan_has_ai_evidence(scan):
+            raise HTTPException(status_code=409, detail="This scan has no eligible drift findings")
+        return _ensure_scan_analysis(scan, database, request.app, explicit_retry=True)
     except sqlite3.Error as exc:
         raise _storage_error() from exc
 

@@ -87,6 +87,25 @@ export type Readiness = {
   demo_controls_enabled: boolean;
 };
 
+export type AIAnalysis = {
+  analysis_id: string;
+  scan_id: string;
+  server_ids: string[];
+  provider: string;
+  model: string | null;
+  status: "pending" | "completed" | "failed" | "disabled";
+  explanation: {
+    format: "structured" | "text";
+    summary: string;
+    impact: string;
+    remediation: string[];
+    prevention: string[];
+  } | null;
+  created_at: string;
+  updated_at: string;
+  error_summary: string | null;
+};
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,

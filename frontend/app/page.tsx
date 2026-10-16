@@ -13,6 +13,7 @@ import {
   Fingerprint,
   Play,
   RefreshCw,
+  Sparkles,
   RotateCcw,
   Shield,
   ShieldAlert,
@@ -23,6 +24,7 @@ import {
 import {
   api,
   describeValue,
+  type AIAnalysis,
   type Baseline,
   type InventoryServer,
   type Readiness,
@@ -79,6 +81,10 @@ export default function Home() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [dataLoadedAt, setDataLoadedAt] = useState("");
+  const [aiAnalysis, setAiAnalysis] = useState<AIAnalysis | null>(null);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError] = useState("");
+  const [aiRefreshKey, setAiRefreshKey] = useState(0);
 
   const refresh = useCallback(async (quiet = false) => {
     if (!quiet) setLoading(true);
@@ -139,10 +145,43 @@ export default function Home() {
     return () => window.clearTimeout(timer);
   }, [refresh]);
 
+  const analysisScanId = activeScan && activeScan.drifted > 0 ? activeScan.scan_id : "";
+
+  useEffect(() => {
+    const scanId = analysisScanId;
+    if (!scanId) return undefined;
+    let cancelled = false;
+    let timer: number;
+    const poll = async () => {
+      setAiLoading(true);
+      try {
+        const record = await api<AIAnalysis>(`/api/scans/${scanId}/analysis`);
+        if (cancelled) return;
+        setAiAnalysis(record);
+        setAiError("");
+        if (record.status === "pending") {
+          timer = window.setTimeout(() => void poll(), 1500);
+        } else {
+          setAiLoading(false);
+        }
+      } catch (reason) {
+        if (cancelled) return;
+        setAiError(reason instanceof Error ? reason.message : "AI analysis status could not be loaded");
+        setAiLoading(false);
+      }
+    };
+    timer = window.setTimeout(() => void poll(), 0);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [analysisScanId, aiRefreshKey]);
+
   const latestScan = useMemo(() => history[0] ?? null, [history]);
   const fleetById = useMemo(() => new Map(fleetStates.map((item) => [item.server_id, item])), [fleetStates]);
   const pendingCount = activeScan?.pending_baseline ?? servers.filter((server) => !server.current_baseline_id && server.status !== "decommissioned").length;
   const scanServers = activeScan?.servers ?? [];
+  const visibleAiAnalysis = aiAnalysis?.scan_id === activeScan?.scan_id ? aiAnalysis : null;
   const openScan = async (scanId: string) => {
     setSelectedScanId(scanId);
     try {
@@ -169,6 +208,22 @@ export default function Home() {
       setError(reason instanceof Error ? reason.message : "Scan could not be completed");
     } finally {
       setBusy(false);
+    }
+  };
+
+  const retryAiAnalysis = async () => {
+    if (!activeScan || busy || aiLoading) return;
+    setAiLoading(true);
+    setAiError("");
+    try {
+      const record = await api<AIAnalysis>(`/api/scans/${activeScan.scan_id}/analysis`, {
+        method: "POST",
+      });
+      setAiAnalysis(record);
+      setAiRefreshKey((key) => key + 1);
+    } catch (reason) {
+      setAiError(reason instanceof Error ? reason.message : "AI analysis request failed");
+      setAiLoading(false);
     }
   };
 
@@ -335,6 +390,27 @@ export default function Home() {
             </details>)}</div>}
           </div>
         </section>
+
+        {activeScan && activeScan.drifted > 0 && <section className="section-card ai-analysis-card">
+          <div className="section-heading"><div><div className="section-kicker"><Sparkles size={13} /> ADVISORY EXPLANATION</div><h2>AI Drift Analysis</h2><p>AI explains verified findings; deterministic detection and severity remain authoritative.</p></div><span className={`ai-state ai-${visibleAiAnalysis?.status ?? (aiError ? "failed" : "pending")}`}>{visibleAiAnalysis?.status ?? (aiError ? "unavailable" : "loading")}</span></div>
+          {aiLoading && <div className="ai-progress"><RefreshCw size={16} className="spin" /> Requesting or retrieving the saved explanation…</div>}
+          {aiError && <div className="ai-message ai-failed"><AlertTriangle size={16} /><span>{aiError}</span></div>}
+          {visibleAiAnalysis?.status === "pending" && !aiError && <div className="ai-message"><RefreshCw size={16} className="spin" /><span>Analysis is pending. Scan results are already saved and available.</span></div>}
+          {visibleAiAnalysis?.status === "disabled" && <div className="ai-message"><CircleHelp size={16} /><span>{visibleAiAnalysis.error_summary ?? "AI analysis is disabled. Enable AI_ENABLED and restart the Monitor to request an explanation."}</span></div>}
+          {visibleAiAnalysis?.status === "failed" && <div className="ai-message ai-failed"><AlertTriangle size={16} /><span>{visibleAiAnalysis.error_summary ?? "The provider did not return an explanation."}</span></div>}
+          {visibleAiAnalysis?.status === "completed" && visibleAiAnalysis.explanation && <>
+            {visibleAiAnalysis.explanation.format === "text" && <div className="ai-message"><CircleHelp size={16} /><span>The provider returned unstructured text; impact and recommendations could not be separately validated.</span></div>}
+            <div className="ai-meta">Model: <b>{visibleAiAnalysis.model ?? "unknown"}</b> · Provider: <b>{visibleAiAnalysis.provider}</b> · Servers: <b>{visibleAiAnalysis.server_ids.join(", ")}</b></div>
+            <div className="ai-sections">
+              <article><h3>What happened</h3><p>{visibleAiAnalysis.explanation.summary}</p></article>
+              <article><h3>Security / Operational Impact</h3><p>{visibleAiAnalysis.explanation.impact}</p></article>
+              <article><h3>Recommended Fix</h3>{visibleAiAnalysis.explanation.remediation.length ? <ul>{visibleAiAnalysis.explanation.remediation.map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}</ul> : <p className="muted">The provider did not return structured remediation steps.</p>}</article>
+              <article><h3>Prevention</h3>{visibleAiAnalysis.explanation.prevention.length ? <ul>{visibleAiAnalysis.explanation.prevention.map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}</ul> : <p className="muted">The provider did not return structured prevention steps.</p>}</article>
+            </div>
+          </>}
+          {(aiError || visibleAiAnalysis?.status === "failed") && <button className="retry-ai-button" disabled={aiLoading || busy} onClick={() => void retryAiAnalysis()}><RefreshCw size={14} />Retry AI analysis</button>}
+          {visibleAiAnalysis?.status === "disabled" && <div className="ai-footnote">No request was sent to the AI provider. Configure AI_ENABLED=true to enable advisory analysis.</div>}
+        </section>}
 
         <footer className="footer-note"><span><Database size={14} /> Data is returned by the live Monitor API and saved to SQLite.</span><span>Audit actors are not authenticated · No automatic remediation</span></footer>
       </div>

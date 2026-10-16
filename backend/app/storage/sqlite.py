@@ -15,6 +15,7 @@ from pydantic import ValidationError
 
 from backend.app.config.baseline import BaselineV1
 from backend.app.core.fingerprinting import fingerprint_config_environment
+from backend.app.schemas.ai_analysis import AIAnalysisRecord, AIExplanation
 from backend.app.schemas.detection import DetectionScan
 from backend.app.schemas.fleet import FleetCollection
 from backend.app.schemas.server_state import ServerStateV1
@@ -22,7 +23,7 @@ from backend.app.schemas.server_state import ServerStateV1
 if TYPE_CHECKING:
     from backend.app.config.registry import ServerRegistration
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def utc_text(value: datetime | None = None) -> str:
@@ -120,6 +121,9 @@ class SQLiteDatabase:
                     connection.execute("ALTER TABLE servers ADD COLUMN endpoint TEXT")
                     connection.execute("ALTER TABLE servers ADD COLUMN instance_id TEXT")
                     version = 2
+                if version == 2:
+                    connection.execute(_AI_ANALYSES_TABLE)
+                    version = 3
                 connection.execute(f"PRAGMA user_version = {version}")
                 connection.commit()
             except BaseException:
@@ -697,6 +701,84 @@ class SQLiteDatabase:
             "result": DetectionScan.model_validate_json(scan["response_json"]),
         }
 
+    def create_or_retry_ai_analysis(
+        self,
+        scan_id: str,
+        *,
+        enabled: bool,
+        provider: str,
+        model: str | None,
+        server_ids: list[str],
+        explicit_retry: bool = False,
+    ) -> AIAnalysisRecord:
+        """Create one scan analysis or requeue a failed/disabled analysis explicitly."""
+        now = utc_text()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM ai_analyses WHERE scan_id = ?", (scan_id,)
+            ).fetchone()
+            if row is None:
+                status = "pending" if enabled else "disabled"
+                error = None if enabled else "AI analysis is disabled by configuration."
+                connection.execute(
+                    """INSERT INTO ai_analyses (
+                        analysis_id, scan_id, server_ids_json, provider, model, status,
+                        explanation_json, created_at, updated_at, error_summary
+                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)""",
+                    (
+                        str(uuid.uuid4()),
+                        scan_id,
+                        _json(sorted(set(server_ids))),
+                        provider,
+                        model,
+                        status,
+                        now,
+                        now,
+                        error,
+                    ),
+                )
+            elif explicit_retry and enabled and row["status"] in {"failed", "disabled"}:
+                connection.execute(
+                    """UPDATE ai_analyses SET status = 'pending', model = ?,
+                        explanation_json = NULL, error_summary = NULL, updated_at = ?
+                        WHERE scan_id = ?""",
+                    (model, now, scan_id),
+                )
+            elif not enabled and row["status"] == "pending":
+                connection.execute(
+                    """UPDATE ai_analyses SET status = 'disabled', error_summary = ?,
+                        updated_at = ? WHERE scan_id = ?""",
+                    ("AI analysis is disabled by configuration.", now, scan_id),
+                )
+            result = connection.execute(
+                "SELECT * FROM ai_analyses WHERE scan_id = ?", (scan_id,)
+            ).fetchone()
+        return _ai_analysis_record(result)
+
+    def get_ai_analysis(self, scan_id: str) -> AIAnalysisRecord | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM ai_analyses WHERE scan_id = ?", (scan_id,)
+            ).fetchone()
+        return _ai_analysis_record(row) if row else None
+
+    def complete_ai_analysis(self, scan_id: str, *, model: str, explanation: AIExplanation) -> None:
+        with self.transaction() as connection:
+            connection.execute(
+                """UPDATE ai_analyses SET status = 'completed', model = ?,
+                    explanation_json = ?, error_summary = NULL, updated_at = ?
+                    WHERE scan_id = ? AND status = 'pending'""",
+                (model, explanation.model_dump_json(), utc_text(), scan_id),
+            )
+
+    def fail_ai_analysis(self, scan_id: str, *, error_summary: str) -> None:
+        with self.transaction() as connection:
+            connection.execute(
+                """UPDATE ai_analyses SET status = 'failed', error_summary = ?,
+                    updated_at = ? WHERE scan_id = ? AND status = 'pending'""",
+                (error_summary[:500], utc_text(), scan_id),
+            )
+
     def close(self) -> None:
         if self._memory_anchor is not None:
             self._memory_anchor.close()
@@ -773,6 +855,22 @@ def _parse_time(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None
 
 
+_AI_ANALYSES_TABLE = """CREATE TABLE IF NOT EXISTS ai_analyses (
+    analysis_id TEXT PRIMARY KEY,
+    scan_id TEXT NOT NULL UNIQUE REFERENCES scans(scan_id) ON DELETE CASCADE,
+    server_ids_json TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'failed', 'disabled')),
+    explanation_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    error_summary TEXT,
+    CHECK ((status = 'completed' AND explanation_json IS NOT NULL)
+        OR (status != 'completed' AND explanation_json IS NULL))
+)"""
+
+
 _SCHEMA = (
     """CREATE TABLE servers (
         server_id TEXT PRIMARY KEY,
@@ -845,4 +943,24 @@ _SCHEMA = (
         PRIMARY KEY (scan_id, server_id)
     )""",
     "CREATE INDEX scan_servers_server ON scan_servers(server_id, scan_id)",
+    _AI_ANALYSES_TABLE,
 )
+
+
+def _ai_analysis_record(row: sqlite3.Row) -> AIAnalysisRecord:
+    return AIAnalysisRecord(
+        analysis_id=row["analysis_id"],
+        scan_id=row["scan_id"],
+        server_ids=json.loads(row["server_ids_json"]),
+        provider=row["provider"],
+        model=row["model"],
+        status=row["status"],
+        explanation=(
+            AIExplanation.model_validate_json(row["explanation_json"])
+            if row["explanation_json"]
+            else None
+        ),
+        created_at=_parse_time(row["created_at"]),
+        updated_at=_parse_time(row["updated_at"]),
+        error_summary=row["error_summary"],
+    )

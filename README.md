@@ -44,6 +44,10 @@ The Docker integration smoke test runs automatically when Docker Engine is reach
 
 `POST /api/scans` performs and persists an on-demand collection and detection pass. Scan history is available at `GET /api/scans` and `GET /api/scans/{scan_id}`. `GET /api/health` reports process health only; `GET /api/ready` checks local database readiness for Compose and reports whether demo controls are enabled. The Monitor uses one Uvicorn worker while scheduling is enabled; startup fails clearly if `WEB_CONCURRENCY` requests multiple workers. Baseline approval has audit metadata but no real authentication in this MVP.
 
+## Advisory AI drift analysis
+
+Set `AI_ENABLED=true`, `AI_BASE_URL`, optional `AI_API_KEY`, optional `AI_MODEL`, and `AI_TIMEOUT_SECONDS` in the ignored local `.env` before starting Compose. The Monitor sends only allowlisted fields from deterministic drift findings to the OpenAI-compatible provider; it does not send full server snapshots. If `AI_MODEL` is empty, it selects a model only when `/models` returns exactly one model ID. AI explanations are stored per scan and can be retrieved or retried through `GET` or `POST /api/scans/{scan_id}/analysis`. A provider failure leaves the saved scan and its deterministic severity unchanged. AI text is advisory and never applies remediation. Provider connectivity and model availability must be verified in the actual deployment; a configured URL alone does not mean AI is available.
+
 ## Demonstration workflow
 
 Start the Monitor and three servers with the Compose command above. In a new terminal, start the Next.js dashboard:

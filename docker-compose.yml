@@ -91,6 +91,11 @@ services:
       SERVER_REGISTRY_FILE: /app/config/servers.json
       SCAN_INTERVAL_SECONDS: "${SCAN_INTERVAL_SECONDS:-60}"
       MONITOR_SCHEDULER_ENABLED: "${MONITOR_SCHEDULER_ENABLED:-true}"
+      AI_ENABLED: "${AI_ENABLED:-false}"
+      AI_BASE_URL: "${AI_BASE_URL:-https://caused-camps-consortium-midi.trycloudflare.com/v1}"
+      AI_API_KEY: "${AI_API_KEY:-}"
+      AI_MODEL: "${AI_MODEL:-}"
+      AI_TIMEOUT_SECONDS: "${AI_TIMEOUT_SECONDS:-20}"
     volumes:
       - configguard_data:/data
     ports:
