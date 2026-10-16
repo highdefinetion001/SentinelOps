@@ -101,7 +101,11 @@ class ScanSummary(FleetModel):
     failed: int
     drifted: int
     unable_to_assess: int
-    pending_baseline: int
+    pending_baseline: int = Field(
+        description=(
+            "Count of server assessments without an approved baseline, not candidate records."
+        )
+    )
 
 
 class ScanList(FleetModel):

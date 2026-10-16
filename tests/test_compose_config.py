@@ -27,3 +27,4 @@ def test_compose_declares_three_private_fleet_services_and_backend() -> None:
     )
     assert "configguard_data:/data" in services["backend"]["volumes"]
     assert "configguard_data" in compose["volumes"]
+    assert "name" not in (compose["volumes"]["configguard_data"] or {})

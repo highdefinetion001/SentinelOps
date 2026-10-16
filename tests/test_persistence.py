@@ -168,9 +168,25 @@ def test_two_servers_use_distinct_approved_baselines(store) -> None:
     by_id = {result.server_id: result for result in report.servers}
     assert by_id["checkout-01"].outcome == "clean"
     assert by_id["checkout-02"].outcome == "clean"
+    assert report.pending_baseline == 0
     assert by_id["checkout-01"].baseline_id != by_id["checkout-02"].baseline_id
     assert report.baseline_versions == {"checkout-01": "1", "checkout-02": "1"}
     assert report.baseline_id is None
+
+
+def test_pending_baseline_scan_count_is_per_server_assessment(store) -> None:
+    states = [make_state(f"checkout-{number:02d}") for number in range(1, 4)]
+    collection = make_collection(*states)
+    store.reconcile_collection(collection)
+
+    scan = detector().detect(collection, approved_baselines=store.approved_baselines())
+
+    assert scan.pending_baseline == 3
+    assert sum(item.outcome == "pending_baseline" for item in scan.servers) == 3
+    pending_candidates = sum(
+        len(store.list_baselines(state.server_id, status="pending")) for state in states
+    )
+    assert pending_candidates == 3
 
 
 def test_fresh_candidate_is_not_auto_approved_by_repeated_scan(store) -> None:

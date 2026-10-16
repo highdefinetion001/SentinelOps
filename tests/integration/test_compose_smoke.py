@@ -6,6 +6,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,36 @@ import pytest
 from backend.app.config.baseline import load_baseline
 
 ROOT = Path(__file__).parents[2]
+
+
+def _new_smoke_project_name() -> str:
+    return f"configguard-phase3-smoke-{uuid.uuid4().hex}"
+
+
+def _smoke_database_url(project_name: str) -> str:
+    return f"sqlite:////data/{project_name}.db"
+
+
+def _compose_cleanup_command(docker: str, project_name: str) -> list[str]:
+    return [docker, "compose", "-p", project_name, "down", "--remove-orphans", "--volumes"]
+
+
+def test_smoke_run_uses_unique_compose_project_and_database() -> None:
+    first_project = _new_smoke_project_name()
+    second_project = _new_smoke_project_name()
+
+    assert first_project != second_project
+    assert first_project.startswith("configguard-phase3-smoke-")
+    assert _smoke_database_url(first_project) != _smoke_database_url(second_project)
+    assert _compose_cleanup_command("docker", first_project) == [
+        "docker",
+        "compose",
+        "-p",
+        first_project,
+        "down",
+        "--remove-orphans",
+        "--volumes",
+    ]
 
 
 def request_json(url: str, *, method: str = "GET", body: dict | None = None) -> dict:
@@ -47,9 +78,16 @@ def test_compose_fleet_state_drift_and_reset() -> None:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
+    project_name = _new_smoke_project_name()
     env = os.environ.copy()
-    env.update({"API_PORT": str(port), "DEMO_MODE": "true"})
-    compose = [docker, "compose", "-p", "configguard-phase1-smoke"]
+    env.update(
+        {
+            "API_PORT": str(port),
+            "DATABASE_URL": _smoke_database_url(project_name),
+            "DEMO_MODE": "true",
+        }
+    )
+    compose = [docker, "compose", "-p", project_name]
 
     try:
         subprocess.run(
@@ -140,7 +178,7 @@ def test_compose_fleet_state_drift_and_reset() -> None:
         assert resolved_scan["drifted"] == 0
     finally:
         subprocess.run(
-            [*compose, "down", "--remove-orphans"],
+            _compose_cleanup_command(docker, project_name),
             cwd=ROOT,
             env=env,
             check=False,

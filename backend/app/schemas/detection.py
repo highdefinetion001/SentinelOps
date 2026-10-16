@@ -97,6 +97,11 @@ class DetectionScan(FleetModel):
     failed: int
     drifted: int
     unable_to_assess: int
-    pending_baseline: int = 0
+    pending_baseline: int = Field(
+        default=0,
+        description=(
+            "Count of server assessments without an approved baseline, not candidate records."
+        ),
+    )
     servers: list[DetectionServerResult]
     baseline_versions: dict[str, str | None] = Field(default_factory=dict)
