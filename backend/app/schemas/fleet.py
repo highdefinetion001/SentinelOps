@@ -14,7 +14,14 @@ class FleetModel(BaseModel):
 
 class CollectionFailure(FleetModel):
     kind: Literal[
-        "timeout", "http_error", "invalid_json", "invalid_state", "unreachable", "request_error"
+        "timeout",
+        "http_error",
+        "invalid_json",
+        "invalid_state",
+        "identity_conflict",
+        "unreachable",
+        "request_error",
+        "not_configured",
     ]
     message: str
     upstream_status: int | None = None

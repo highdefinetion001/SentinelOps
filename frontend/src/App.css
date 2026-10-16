@@ -2319,3 +2319,13 @@ button:focus:not(:focus-visible) {
 .status-policy .status-dot {
   background: #ffb547;
 }
+
+.status-pending {
+  color: var(--blue);
+  border-color: rgba(101, 169, 255, 0.25);
+  background: rgba(101, 169, 255, 0.08);
+}
+
+.status-pending .status-dot {
+  background: var(--blue);
+}

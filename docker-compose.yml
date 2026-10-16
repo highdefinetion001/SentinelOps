@@ -61,7 +61,10 @@ services:
       API_HOST: 0.0.0.0
       API_PORT: 8000
       DEMO_MODE: "${DEMO_MODE:-false}"
+      DATABASE_URL: "${DATABASE_URL:-sqlite:////data/configguard.db}"
       FLEET_SERVERS: "${FLEET_SERVERS:-server-01=http://server-01:8080,server-02=http://server-02:8080,server-03=http://server-03:8080}"
+    volumes:
+      - configguard_data:/data
     ports:
       - "${API_HOST:-127.0.0.1}:${API_PORT:-8000}:8000"
     networks:
@@ -91,3 +94,6 @@ networks:
     internal: true
   api:
     driver: bridge
+
+volumes:
+  configguard_data:

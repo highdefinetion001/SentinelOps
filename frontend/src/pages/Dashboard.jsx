@@ -66,7 +66,11 @@ function mapDetectionToServers(scan, fleet) {
           : "Stable"
         : result.outcome === "drifted"
           ? "Drift detected"
-          : "Unreachable";
+          : result.outcome === "pending_baseline"
+            ? "Pending baseline"
+            : result.collection_status === "failed"
+              ? "Unreachable"
+              : "Unable to assess";
     const service = result.service_group || "Unknown service";
     const runtime = state?.environment?.runtime_version;
 
@@ -107,6 +111,8 @@ function StatusBadge({ status }) {
           ? "status-scanning"
           : status === "Policy violation"
             ? "status-policy"
+        : status === "Pending baseline" || status === "Unable to assess"
+          ? "status-pending"
             : "status-drift";
 
   return (

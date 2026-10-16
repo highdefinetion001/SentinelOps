@@ -90,7 +90,23 @@ def test_compose_fleet_state_drift_and_reset() -> None:
 
         initial_scan = request_json(f"{base}/api/scans", method="POST")
         assert initial_scan["status"] == "complete"
+        assert initial_scan["pending_baseline"] == 3
         assert initial_scan["drifted"] == 0
+
+        for server_id in ("server-01", "server-02", "server-03"):
+            candidates = request_json(f"{base}/api/servers/{server_id}/baseline-candidates")
+            assert len(candidates["items"]) == 1
+            candidate = candidates["items"][0]
+            approval = request_json(
+                f"{base}/api/servers/{server_id}/baselines/{candidate['baseline_id']}/approve",
+                method="POST",
+                body={"confirm": True, "approved_by": "integration-test-admin"},
+            )
+            assert approval["status"] == "approved"
+
+        approved_scan = request_json(f"{base}/api/scans", method="POST")
+        assert approved_scan["pending_baseline"] == 0
+        assert approved_scan["drifted"] == 0
 
         request_json(
             f"{base}/api/fleet/server-03/simulate-drift",

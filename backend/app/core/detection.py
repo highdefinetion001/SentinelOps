@@ -47,7 +47,6 @@ DETECTOR_VERSION = "1.0.0"
 
 
 class DriftDetector:
-
     def __init__(self, baseline: BaselineV1, policy: DetectionPolicy) -> None:
         if policy.applies_to.service_group != baseline.service_group:
             raise ValueError("Policy service_group must match the approved baseline service_group")
@@ -63,6 +62,8 @@ class DriftDetector:
         *,
         scan_id: str | None = None,
         scanned_at: datetime | None = None,
+        approved_baselines: Mapping[str, BaselineV1] | None = None,
+        blocked_servers: Mapping[str, str] | None = None,
     ) -> DetectionScan:
         valid_states = {
             result.server_id: result.state
@@ -71,7 +72,17 @@ class DriftDetector:
         }
         peers = _peer_comparisons(collection.servers, valid_states, self.policy)
         results = [
-            self._detect_server(result, peers[result.server_id]) for result in collection.servers
+            self._detect_server(
+                result,
+                peers[result.server_id],
+                baseline=(
+                    approved_baselines.get(result.server_id)
+                    if approved_baselines is not None
+                    else self.baseline
+                ),
+                blocked_reason=(blocked_servers or {}).get(result.server_id),
+            )
+            for result in collection.servers
         ]
         results.sort(key=lambda result: result.server_id)
         return DetectionScan(
@@ -79,23 +90,53 @@ class DriftDetector:
             scanned_at=scanned_at or datetime.now(UTC),
             status=collection.status,
             detector_version=DETECTOR_VERSION,
-            baseline_id=self.baseline.baseline_id,
-            baseline_version=self.baseline.baseline_version,
-            baseline_fingerprint=self.baseline_fingerprint,
+            baseline_id=self.baseline.baseline_id if approved_baselines is None else None,
+            baseline_version=self.baseline.baseline_version if approved_baselines is None else None,
+            baseline_fingerprint=self.baseline_fingerprint if approved_baselines is None else None,
             policy_version=self.policy.policy_version,
             total=collection.total,
             successful=collection.successful,
             failed=collection.failed,
             drifted=sum(result.outcome == "drifted" for result in results),
             unable_to_assess=sum(result.outcome == "unable_to_assess" for result in results),
+            pending_baseline=sum(result.outcome == "pending_baseline" for result in results),
             servers=results,
+            baseline_versions={result.server_id: result.baseline_version for result in results},
         )
 
     def _detect_server(
-        self, collection: ServerCollection, peer_comparison: PeerComparison
+        self,
+        collection: ServerCollection,
+        peer_comparison: PeerComparison,
+        *,
+        baseline: BaselineV1 | None,
+        blocked_reason: str | None = None,
     ) -> DetectionServerResult:
-        baseline_fingerprint = self.baseline_fingerprint
+        baseline_fingerprint = (
+            fingerprint_config_environment(baseline.expected_config, baseline.expected_environment)
+            if baseline is not None
+            else None
+        )
+        baseline_id = baseline.baseline_id if baseline is not None else None
+        baseline_version = baseline.baseline_version if baseline is not None else None
         state = collection.state
+        if blocked_reason:
+            return DetectionServerResult(
+                server_id=collection.server_id,
+                service_group=state.service if state else None,
+                collection_status=collection.status,
+                outcome="unable_to_assess",
+                baseline_drift_detected=None,
+                baseline_fingerprint=baseline_fingerprint,
+                observed_fingerprint=collection.fingerprint if state else None,
+                findings=[],
+                policy_violations=[],
+                peer_comparison=peer_comparison,
+                collection_error=collection.error,
+                assessment_error=blocked_reason,
+                baseline_id=baseline_id,
+                baseline_version=baseline_version,
+            )
         if collection.status != "success" or state is None:
             return DetectionServerResult(
                 server_id=collection.server_id,
@@ -110,11 +151,27 @@ class DriftDetector:
                 peer_comparison=peer_comparison,
                 collection_error=collection.error,
                 assessment_error="collection_failed_or_state_unavailable",
+                baseline_id=baseline_id,
+                baseline_version=baseline_version,
             )
 
         observed_fingerprint = collection.fingerprint or fingerprint_state(state)
+        if baseline is None:
+            return DetectionServerResult(
+                server_id=collection.server_id,
+                service_group=state.service,
+                collection_status="success",
+                outcome="pending_baseline",
+                baseline_drift_detected=None,
+                baseline_fingerprint=None,
+                observed_fingerprint=observed_fingerprint,
+                findings=[],
+                policy_violations=[],
+                peer_comparison=peer_comparison,
+                assessment_error="baseline_pending_approval",
+            )
         state_group = state.service
-        if state_group != self.baseline.service_group:
+        if state_group != baseline.service_group:
             return DetectionServerResult(
                 server_id=collection.server_id,
                 service_group=state_group,
@@ -127,11 +184,45 @@ class DriftDetector:
                 policy_violations=[],
                 peer_comparison=peer_comparison,
                 assessment_error="service_group_mismatch",
+                baseline_id=baseline_id,
+                baseline_version=baseline_version,
+            )
+        if baseline.service_group != self.policy.applies_to.service_group:
+            return DetectionServerResult(
+                server_id=collection.server_id,
+                service_group=state_group,
+                collection_status="success",
+                outcome="unable_to_assess",
+                baseline_drift_detected=None,
+                baseline_fingerprint=baseline_fingerprint,
+                observed_fingerprint=observed_fingerprint,
+                findings=[],
+                policy_violations=[],
+                peer_comparison=peer_comparison,
+                assessment_error="policy_unavailable_for_service_group",
+                baseline_id=baseline_id,
+                baseline_version=baseline_version,
+            )
+        if baseline.policy_version != self.policy.policy_version:
+            return DetectionServerResult(
+                server_id=collection.server_id,
+                service_group=state_group,
+                collection_status="success",
+                outcome="unable_to_assess",
+                baseline_drift_detected=None,
+                baseline_fingerprint=baseline_fingerprint,
+                observed_fingerprint=observed_fingerprint,
+                findings=[],
+                policy_violations=[],
+                peer_comparison=peer_comparison,
+                assessment_error="policy_version_mismatch",
+                baseline_id=baseline_id,
+                baseline_version=baseline_version,
             )
 
         expected = {
-            "config": self.baseline.expected_config.model_dump(mode="json"),
-            "environment": self.baseline.expected_environment.model_dump(mode="json"),
+            "config": baseline.expected_config.model_dump(mode="json"),
+            "environment": baseline.expected_environment.model_dump(mode="json"),
         }
         actual = {
             "config": state.config.model_dump(mode="json"),
@@ -161,6 +252,8 @@ class DriftDetector:
             findings=findings,
             policy_violations=violations,
             peer_comparison=peer_comparison,
+            baseline_id=baseline_id,
+            baseline_version=baseline_version,
         )
 
 

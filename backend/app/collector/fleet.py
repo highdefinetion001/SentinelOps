@@ -135,7 +135,7 @@ class FleetCollector:
         if state.server_id != server_id:
             return self._failure(
                 server_id,
-                "invalid_state",
+                "identity_conflict",
                 "Server identity did not match the configured server ID.",
             )
 

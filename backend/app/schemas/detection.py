@@ -3,6 +3,8 @@
 from datetime import datetime
 from typing import Any, Literal
 
+from pydantic import Field
+
 from backend.app.config.policy import Severity
 from backend.app.schemas.fleet import CollectionFailure, FleetModel
 
@@ -68,15 +70,17 @@ class DetectionServerResult(FleetModel):
     server_id: str
     service_group: str | None
     collection_status: Literal["success", "failed"]
-    outcome: Literal["clean", "drifted", "unable_to_assess"]
+    outcome: Literal["clean", "drifted", "pending_baseline", "unable_to_assess"]
     baseline_drift_detected: bool | None
-    baseline_fingerprint: str
+    baseline_fingerprint: str | None
     observed_fingerprint: str | None
     findings: list[DetectionFinding]
     policy_violations: list[PolicyViolation]
     peer_comparison: PeerComparison
     collection_error: CollectionFailure | None = None
     assessment_error: str | None = None
+    baseline_id: str | None = None
+    baseline_version: str | None = None
 
 
 class DetectionScan(FleetModel):
@@ -84,13 +88,15 @@ class DetectionScan(FleetModel):
     scanned_at: datetime
     status: Literal["complete", "partial", "failed"]
     detector_version: str
-    baseline_id: str
-    baseline_version: str
-    baseline_fingerprint: str
+    baseline_id: str | None
+    baseline_version: str | None
+    baseline_fingerprint: str | None
     policy_version: str
     total: int
     successful: int
     failed: int
     drifted: int
     unable_to_assess: int
+    pending_baseline: int = 0
     servers: list[DetectionServerResult]
+    baseline_versions: dict[str, str | None] = Field(default_factory=dict)

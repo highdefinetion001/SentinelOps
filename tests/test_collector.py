@@ -95,7 +95,7 @@ def test_collector_rejects_state_with_wrong_server_identity() -> None:
         FleetCollector({"server-01": "http://server-01"}, transport=transport).collect()
     )
     assert result.servers[0].status == "failed"
-    assert result.servers[0].error.kind == "invalid_state"
+    assert result.servers[0].error.kind == "identity_conflict"
 
 
 def test_server_registry_requires_explicit_valid_entries() -> None:

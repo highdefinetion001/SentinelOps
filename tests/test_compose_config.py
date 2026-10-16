@@ -22,3 +22,8 @@ def test_compose_declares_three_private_fleet_services_and_backend() -> None:
     assert compose["networks"]["fleet"]["driver"] == "bridge"
     assert compose["networks"]["fleet"]["internal"] is True
     assert "fleet" in services["backend"]["networks"]
+    assert services["backend"]["environment"]["DATABASE_URL"] == (
+        "${DATABASE_URL:-sqlite:////data/configguard.db}"
+    )
+    assert "configguard_data:/data" in services["backend"]["volumes"]
+    assert "configguard_data" in compose["volumes"]

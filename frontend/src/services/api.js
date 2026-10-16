@@ -22,6 +22,44 @@ async function request(path, options = {}) {
 export const getHealth = () => request("/api/health");
 export const getFleet = () => request("/api/fleet/states");
 export const runFleetScan = () => request("/api/scans", { method: "POST" });
+export const getServerInventory = ({ limit = 100, offset = 0 } = {}) =>
+  request(`/api/servers?limit=${limit}&offset=${offset}`);
+export const getServer = (serverId) =>
+  request(`/api/servers/${encodeURIComponent(serverId)}`);
+export const getCurrentBaseline = (serverId) =>
+  request(`/api/servers/${encodeURIComponent(serverId)}/baseline`);
+export const getBaselineHistory = (serverId) =>
+  request(`/api/servers/${encodeURIComponent(serverId)}/baselines`);
+export const getBaselineCandidates = (serverId) =>
+  request(`/api/servers/${encodeURIComponent(serverId)}/baseline-candidates`);
+export const requestBaselineCandidate = (serverId, { requestedBy, reason } = {}) =>
+  request(`/api/servers/${encodeURIComponent(serverId)}/baseline-candidates`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ requested_by: requestedBy, reason }),
+  });
+export const approveBaselineCandidate = (
+  serverId,
+  baselineId,
+  { approvedBy, reason } = {},
+) =>
+  request(
+    `/api/servers/${encodeURIComponent(serverId)}/baselines/${encodeURIComponent(baselineId)}/approve`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: true, approved_by: approvedBy, reason }),
+    },
+  );
+export const decommissionServer = (serverId) =>
+  request(`/api/servers/${encodeURIComponent(serverId)}/decommission`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ confirm: true }),
+  });
+export const getScanHistory = ({ limit = 20, offset = 0 } = {}) =>
+  request(`/api/scans?limit=${limit}&offset=${offset}`);
+export const getScan = (scanId) => request(`/api/scans/${encodeURIComponent(scanId)}`);
 
 export const simulateDrift = (serverId) =>
   request(`/api/fleet/${encodeURIComponent(serverId)}/simulate-drift`, {

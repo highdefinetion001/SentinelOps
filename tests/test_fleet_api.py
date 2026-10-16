@@ -2,6 +2,7 @@ import json
 from datetime import UTC, datetime
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from backend.app.collector.fleet import FleetCollector
@@ -31,6 +32,11 @@ def server_state(server_id: str, config: dict[str, object] | None = None) -> dic
     }
 
 
+@pytest.fixture(autouse=True)
+def isolated_database(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'api.db'}")
+
+
 def test_fleet_states_endpoint_returns_success_and_partial_failure() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "server-02":
@@ -54,7 +60,7 @@ def test_fleet_states_endpoint_returns_success_and_partial_failure() -> None:
     assert response.json()["servers"][1]["error"]["kind"] == "unreachable"
 
 
-def test_post_scans_returns_structured_deterministic_assessment() -> None:
+def test_scan_requires_explicit_baseline_approval_before_clean_assessment() -> None:
     state = server_state("server-01")
     collector = FleetCollector(
         {"server-01": "http://server-01"},
@@ -66,14 +72,24 @@ def test_post_scans_returns_structured_deterministic_assessment() -> None:
     try:
         with TestClient(app) as client:
             response = client.post("/api/scans")
+            candidates = client.get("/api/servers/server-01/baseline-candidates")
+            candidate = candidates.json()["items"][0]
+            approval = client.post(
+                f"/api/servers/server-01/baselines/{candidate['baseline_id']}/approve",
+                json={"confirm": True, "approved_by": "test-admin"},
+            )
+            clean_scan = client.post("/api/scans")
     finally:
         app.dependency_overrides.clear()
     assert response.status_code == 200
-    body = response.json()
-    assert body["baseline_id"] == "checkout-production"
-    assert body["successful"] == 1
-    assert body["drifted"] == 0
-    assert body["servers"][0]["outcome"] == "clean"
+    assert response.json()["pending_baseline"] == 1
+    assert response.json()["servers"][0]["outcome"] == "pending_baseline"
+    assert candidates.status_code == 200
+    assert approval.status_code == 200
+    assert approval.json()["approved_by"] == "test-admin"
+    assert clean_scan.json()["successful"] == 1
+    assert clean_scan.json()["drifted"] == 0
+    assert clean_scan.json()["servers"][0]["outcome"] == "clean"
 
 
 def test_drift_and_reset_routes_validate_and_verify_remote_changes(monkeypatch) -> None:
@@ -170,3 +186,15 @@ def test_api_demo_controls_require_demo_mode(monkeypatch) -> None:
             "/api/fleet/server-01/simulate-drift", json={"scenario": "security_drift"}
         )
     assert response.status_code == 409
+
+
+def test_server_and_scan_history_endpoints_return_404_and_paginated_data() -> None:
+    with TestClient(app) as client:
+        unknown = client.get("/api/servers/missing")
+        missing_scan = client.get("/api/scans/00000000-0000-0000-0000-000000000000")
+        history = client.get("/api/scans?limit=5&offset=0")
+
+    assert unknown.status_code == 404
+    assert missing_scan.status_code == 404
+    assert history.status_code == 200
+    assert history.json() == {"items": [], "limit": 5, "offset": 0}
