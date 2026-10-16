@@ -9,7 +9,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
@@ -19,7 +19,10 @@ from backend.app.schemas.detection import DetectionScan
 from backend.app.schemas.fleet import FleetCollection
 from backend.app.schemas.server_state import ServerStateV1
 
-SCHEMA_VERSION = 1
+if TYPE_CHECKING:
+    from backend.app.config.registry import ServerRegistration
+
+SCHEMA_VERSION = 2
 
 
 def utc_text(value: datetime | None = None) -> str:
@@ -111,11 +114,67 @@ class SQLiteDatabase:
                 if version == 0:
                     for statement in _SCHEMA:
                         connection.execute(statement)
-                    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                    version = SCHEMA_VERSION
+                if version == 1:
+                    connection.execute("ALTER TABLE servers ADD COLUMN server_type TEXT")
+                    connection.execute("ALTER TABLE servers ADD COLUMN endpoint TEXT")
+                    connection.execute("ALTER TABLE servers ADD COLUMN instance_id TEXT")
+                    version = 2
+                connection.execute(f"PRAGMA user_version = {version}")
                 connection.commit()
             except BaseException:
                 connection.rollback()
                 raise
+
+    def register_servers(self, registrations: list[ServerRegistration]) -> dict[str, str]:
+        """Reconcile operator declarations without reactivating or replacing identities."""
+        now = utc_text()
+        statuses: dict[str, str] = {}
+        with self.transaction() as connection:
+            for registration in registrations:
+                server_id = registration.server_id
+                row = connection.execute(
+                    "SELECT * FROM servers WHERE server_id = ?", (server_id,)
+                ).fetchone()
+                if row is None:
+                    connection.execute(
+                        """INSERT INTO servers (
+                            server_id, display_name, role, server_type, endpoint,
+                            lifecycle_status, reachability, first_seen
+                        ) VALUES (?, ?, NULL, ?, ?, 'newly_enrolled', 'unknown', ?)""",
+                        (
+                            server_id,
+                            registration.display_name,
+                            registration.role,
+                            registration.endpoint.rstrip("/"),
+                            now,
+                        ),
+                    )
+                    statuses[server_id] = "newly_enrolled"
+                    continue
+                if row["lifecycle_status"] == "decommissioned":
+                    statuses[server_id] = "decommissioned"
+                    continue
+                endpoint = registration.endpoint.rstrip("/")
+                conflicts = (row["server_type"] and row["server_type"] != registration.role) or (
+                    row["endpoint"] and row["endpoint"] != endpoint
+                )
+                if conflicts:
+                    connection.execute(
+                        "UPDATE servers SET lifecycle_status = 'identity_conflict' "
+                        "WHERE server_id = ?",
+                        (server_id,),
+                    )
+                    statuses[server_id] = "identity_conflict"
+                    continue
+                connection.execute(
+                    """UPDATE servers SET display_name = ?,
+                        server_type = COALESCE(server_type, ?),
+                        endpoint = COALESCE(endpoint, ?) WHERE server_id = ?""",
+                    (registration.display_name, registration.role, endpoint, server_id),
+                )
+                statuses[server_id] = row["lifecycle_status"]
+        return statuses
 
     def reconcile_collection(
         self, collection: FleetCollection, *, policy_version: str = "1.0"
@@ -132,17 +191,20 @@ class SQLiteDatabase:
                 reported_conflict = bool(result.error and result.error.kind == "identity_conflict")
                 if row is None:
                     role = state.service if state else None
-                    display_name = _display_name(result.server_id)
+                    display_name = result.display_name or _display_name(result.server_id)
                     lifecycle = "identity_conflict" if reported_conflict else "newly_enrolled"
                     connection.execute(
                         """INSERT INTO servers (
-                            server_id, display_name, role, lifecycle_status, reachability,
+                            server_id, display_name, role, server_type, instance_id,
+                            lifecycle_status, reachability,
                             first_seen, last_seen, last_attempt
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             result.server_id,
                             display_name,
                             role,
+                            result.role,
+                            result.instance_id,
                             lifecycle,
                             "reachable" if state else "unreachable",
                             attempt,
@@ -160,6 +222,21 @@ class SQLiteDatabase:
                             "UPDATE servers SET last_attempt = ?, reachability = ? "
                             "WHERE server_id = ?",
                             (attempt, "reachable" if state else "unreachable", result.server_id),
+                        )
+                        states[result.server_id] = "identity_conflict"
+                        continue
+                    if state and (
+                        (row["server_type"] and result.role and row["server_type"] != result.role)
+                        or (
+                            row["instance_id"]
+                            and result.instance_id
+                            and row["instance_id"] != result.instance_id
+                        )
+                    ):
+                        connection.execute(
+                            "UPDATE servers SET lifecycle_status = 'identity_conflict', "
+                            "reachability = 'reachable', last_attempt = ? WHERE server_id = ?",
+                            (attempt, result.server_id),
                         )
                         states[result.server_id] = "identity_conflict"
                         continue
@@ -184,9 +261,21 @@ class SQLiteDatabase:
                         lifecycle = "active" if row["current_baseline_id"] else "pending_baseline"
                         connection.execute(
                             """UPDATE servers SET role = COALESCE(role, ?),
+                                server_type = COALESCE(server_type, ?),
+                                instance_id = COALESCE(instance_id, ?),
+                                display_name = COALESCE(?, display_name),
                                 lifecycle_status = ?, reachability = 'reachable',
                                 last_seen = ?, last_attempt = ? WHERE server_id = ?""",
-                            (state.service, lifecycle, attempt, attempt, result.server_id),
+                            (
+                                state.service,
+                                result.role,
+                                result.instance_id,
+                                result.display_name,
+                                lifecycle,
+                                attempt,
+                                attempt,
+                                result.server_id,
+                            ),
                         )
                     else:
                         connection.execute(
@@ -628,6 +717,8 @@ def _json(value: object) -> str:
 
 def _server_record(row: sqlite3.Row) -> dict[str, Any]:
     result = dict(row)
+    result.pop("endpoint", None)
+    result.pop("instance_id", None)
     for name in ("first_seen", "last_seen", "last_attempt", "decommissioned_at"):
         result[name] = _parse_time(result[name])
     result["status"] = _public_server_status(result)
@@ -687,6 +778,9 @@ _SCHEMA = (
         server_id TEXT PRIMARY KEY,
         display_name TEXT NOT NULL,
         role TEXT,
+        server_type TEXT,
+        endpoint TEXT,
+        instance_id TEXT,
         lifecycle_status TEXT NOT NULL CHECK (lifecycle_status IN (
             'newly_enrolled', 'pending_baseline', 'active', 'identity_conflict', 'decommissioned')),
         reachability TEXT NOT NULL CHECK (reachability IN (

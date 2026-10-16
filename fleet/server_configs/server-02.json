@@ -5,8 +5,8 @@
   "config_version": "v1",
   "config": {
     "debug_mode": false,
-    "max_connections": 200,
-    "log_level": "INFO",
+    "max_connections": 240,
+    "log_level": "WARNING",
     "tls_min_version": "TLS1.2"
   },
   "environment": {

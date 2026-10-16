@@ -100,3 +100,39 @@ def test_server_id_mismatch_prevents_startup(tmp_path: Path) -> None:
     write_definition(config, "server-01")
     with pytest.raises(RuntimeError, match="does not match SERVER_ID"):
         create_app(config, expected_server_id="server-03")
+
+
+def test_restart_preserves_instance_identity_and_allowlisted_demo_drift(tmp_path: Path) -> None:
+    config = tmp_path / "server.json"
+    identity = tmp_path / "state" / "instance-id"
+    write_definition(config, "server-01")
+    options = {
+        "expected_server_id": "server-01",
+        "demo_enabled": True,
+        "display_name": "Checkout Web",
+        "role": "web",
+        "identity_file": identity,
+    }
+    with TestClient(create_app(config, **options)) as first:
+        initial = first.get("/state")
+        first_id = initial.headers["x-configguard-instance-id"]
+        assert initial.headers["x-configguard-role"] == "web"
+        assert first.post("/demo/drift", json={"scenario": "security_drift"}).status_code == 200
+
+    with TestClient(create_app(config, **options)) as restarted:
+        after_restart = restarted.get("/state")
+        assert after_restart.headers["x-configguard-instance-id"] == first_id
+        assert after_restart.json()["config"]["debug_mode"] is True
+        reset = restarted.post("/demo/reset")
+        assert reset.status_code == 200
+        assert restarted.get("/state").json()["config"]["debug_mode"] is False
+
+
+def test_collector_metadata_is_not_added_to_state_json(tmp_path: Path) -> None:
+    config = tmp_path / "server.json"
+    write_definition(config, "server-01")
+    with TestClient(create_app(config, role="database")) as client:
+        response = client.get("/state")
+    assert response.json()["schema_version"] == "1.0"
+    assert "role" not in response.json()
+    assert response.headers["x-configguard-role"] == "database"

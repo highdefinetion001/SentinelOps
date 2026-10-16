@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 import httpx
 
 from backend.app.collector.fleet import FleetCollector, parse_server_registry
+from backend.app.config.registry import ServerRegistration
 from backend.app.core.fingerprinting import fingerprint_state
 
 
@@ -36,6 +37,80 @@ def test_collector_accepts_valid_state_and_computes_fingerprint() -> None:
     assert result.servers[0].state is not None
     assert result.servers[0].state.server_id == "server-01"
     assert result.servers[0].fingerprint == fingerprint_state(result.servers[0].state)
+
+
+def test_registered_collector_metadata_is_verified_and_returned() -> None:
+    registration = ServerRegistration(
+        server_id="server-01",
+        display_name="Checkout Web",
+        role="web",
+        endpoint="http://server-01:8080",
+    )
+    headers = {
+        "X-ConfigGuard-Server-ID": "server-01",
+        "X-ConfigGuard-Display-Name": "Checkout Web",
+        "X-ConfigGuard-Role": "web",
+        "X-ConfigGuard-Collector-Version": "1.0",
+        "X-ConfigGuard-Instance-ID": "a" * 32,
+    }
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json=state_payload(), headers=headers)
+    )
+    result = asyncio.run(
+        FleetCollector(
+            {"server-01": registration.endpoint},
+            registrations={"server-01": registration},
+            transport=transport,
+        ).collect()
+    )
+    server = result.servers[0]
+    assert server.status == "success"
+    assert server.display_name == "Checkout Web"
+    assert server.role == "web"
+    assert server.collector_version == "1.0"
+    assert server.instance_id == "a" * 32
+
+
+def test_collector_rejects_registered_identity_mismatch() -> None:
+    registration = ServerRegistration(
+        server_id="server-01",
+        display_name="Checkout Web",
+        role="web",
+        endpoint="http://server-01:8080",
+    )
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            json=state_payload(),
+            headers={
+                "X-ConfigGuard-Server-ID": "replacement",
+                "X-ConfigGuard-Display-Name": "Checkout Web",
+                "X-ConfigGuard-Role": "web",
+                "X-ConfigGuard-Collector-Version": "1.0",
+                "X-ConfigGuard-Instance-ID": "b" * 32,
+            },
+        )
+    )
+    result = asyncio.run(
+        FleetCollector(
+            {"server-01": registration.endpoint},
+            registrations={"server-01": registration},
+            transport=transport,
+        ).collect()
+    )
+    assert result.servers[0].status == "failed"
+    assert result.servers[0].error.kind == "identity_conflict"
+
+
+def test_collector_bounds_response_size() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=b" " * (64 * 1024 + 1), request=request)
+    )
+    result = asyncio.run(
+        FleetCollector({"server-01": "http://server-01"}, transport=transport).collect()
+    )
+    assert result.servers[0].status == "failed"
+    assert result.servers[0].error.kind == "response_too_large"
 
 
 def test_collector_returns_classified_partial_failures() -> None:

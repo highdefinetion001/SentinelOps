@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 
@@ -6,11 +7,12 @@ import pytest
 
 from backend.app.config.baseline import load_baseline
 from backend.app.config.policy import load_policy
+from backend.app.config.registry import ServerRegistration
 from backend.app.core.detection import DriftDetector
 from backend.app.core.fingerprinting import fingerprint_state
 from backend.app.schemas.fleet import CollectionFailure, FleetCollection, ServerCollection
 from backend.app.schemas.server_state import ServerStateV1
-from backend.app.storage.sqlite import SQLiteDatabase
+from backend.app.storage.sqlite import _SCHEMA, SCHEMA_VERSION, SQLiteDatabase
 
 
 def make_state(
@@ -107,6 +109,94 @@ def test_first_collection_registers_server_and_creates_only_pending_candidate(st
     assert server["current_baseline_id"] is None
     assert candidate["status"] == "pending"
     assert store.approved_baselines() == {}
+
+
+def test_declared_registration_is_idempotent_and_endpoint_change_conflicts(store) -> None:
+    registration = ServerRegistration(
+        server_id="checkout-01",
+        display_name="Checkout Web",
+        role="web",
+        endpoint="http://web-server:8080",
+    )
+    assert store.register_servers([registration])["checkout-01"] == "newly_enrolled"
+    assert store.register_servers([registration])["checkout-01"] == "newly_enrolled"
+    assert len(store.list_servers()) == 1
+    assert store.get_server("checkout-01")["server_type"] == "web"
+    replacement = registration.model_copy(update={"endpoint": "http://replacement:8080"})
+    assert store.register_servers([replacement])["checkout-01"] == "identity_conflict"
+    assert store.get_server("checkout-01")["status"] == "identity_conflict"
+
+
+def test_replacement_instance_cannot_reuse_enrolled_identity_baseline(store) -> None:
+    registration = ServerRegistration(
+        server_id="checkout-01",
+        display_name="Checkout Web",
+        role="web",
+        endpoint="http://web-server:8080",
+    )
+    store.register_servers([registration])
+    state = make_state("checkout-01")
+    first = ServerCollection(
+        server_id="checkout-01",
+        status="success",
+        state=state,
+        fingerprint=fingerprint_state(state),
+        display_name="Checkout Web",
+        role="web",
+        collector_version="1.0",
+        instance_id="a" * 32,
+    )
+    store.reconcile_collection(
+        FleetCollection(
+            collected_at=datetime.now(UTC),
+            status="complete",
+            total=1,
+            successful=1,
+            failed=0,
+            servers=[first],
+        )
+    )
+    assert len(store.list_baselines("checkout-01", status="pending")) == 1
+    replacement = first.model_copy(update={"instance_id": "b" * 32})
+    statuses = store.reconcile_collection(
+        FleetCollection(
+            collected_at=datetime.now(UTC),
+            status="complete",
+            total=1,
+            successful=1,
+            failed=0,
+            servers=[replacement],
+        )
+    )
+    assert statuses["checkout-01"] == "identity_conflict"
+    assert len(store.list_baselines("checkout-01", status="pending")) == 1
+
+
+def test_schema_v1_database_migrates_without_losing_server_records(tmp_path) -> None:
+    database_file = tmp_path / "phase3.db"
+    connection = sqlite3.connect(database_file)
+    for statement in _SCHEMA:
+        if statement.startswith("CREATE TABLE servers"):
+            statement = statement.replace("        server_type TEXT,\n", "")
+            statement = statement.replace("        endpoint TEXT,\n", "")
+            statement = statement.replace("        instance_id TEXT,\n", "")
+        connection.execute(statement)
+    connection.execute(
+        """INSERT INTO servers (
+            server_id, display_name, role, lifecycle_status, reachability, first_seen
+        ) VALUES ('legacy-01', 'Legacy 01', 'checkout-api', 'active', 'reachable',
+            '2026-10-16T00:00:00Z')"""
+    )
+    connection.execute("PRAGMA user_version = 1")
+    connection.commit()
+    connection.close()
+
+    migrated = SQLiteDatabase(f"sqlite:///{database_file}")
+    migrated.initialize()
+    assert migrated.get_server("legacy-01")["display_name"] == "Legacy 01"
+    assert migrated.get_server("legacy-01")["server_type"] is None
+    with migrated.connection() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
 
 
 def test_repeated_collection_never_auto_approves_or_duplicates_candidate(store) -> None:

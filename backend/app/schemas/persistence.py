@@ -14,6 +14,7 @@ class ServerInventoryRecord(FleetModel):
     server_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
     display_name: str
     role: str | None
+    server_type: str | None = None
     lifecycle_status: Literal[
         "newly_enrolled", "pending_baseline", "active", "identity_conflict", "decommissioned"
     ]

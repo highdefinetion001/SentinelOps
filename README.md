@@ -1,6 +1,6 @@
 # ConfigGuard AI
 
-Local configuration drift demo: three isolated server containers expose validated state to a FastAPI backend over a private Compose network. The backend compares each server with its independently approved baseline, applies YAML policy severities, and reports peer similarity as supplementary evidence. Server inventory, baseline versions, scans, and findings persist in SQLite.
+Local configuration drift demo: a dedicated Monitor container collects validated state from three independently configured server containers over a private Compose network. The Monitor compares each server with its independently approved baseline, applies YAML policy severities, and reports peer similarity as supplementary evidence. Server inventory, baseline versions, scans, and findings persist in SQLite.
 
 ## Start
 
@@ -11,7 +11,7 @@ cp .env.example .env
 docker compose up --build -d --wait
 ```
 
-The backend listens on `http://localhost:8000`. The simulated servers have no published host ports. `DEMO_MODE=true` in the example `.env` enables the predefined controls. Set it to `false` and recreate the services to disable them. SQLite data lives in the named `configguard_data` volume and survives `docker compose down`; `docker compose down -v` removes it.
+The Monitor listens on `http://localhost:8000`. The simulated servers have no published host ports. `DEMO_MODE=true` in the example `.env` enables the predefined demo drift and reset actions. Set it to `false` and recreate the services to disable them. SQLite data lives in the existing named `configguard_data` volume and survives container recreation and `docker compose down`; `docker compose down -v` removes the current Compose project's volumes.
 
 ```bash
 curl http://localhost:8000/api/health
@@ -29,7 +29,7 @@ curl http://localhost:8000/api/fleet/states
 
 To stop the demo, run `docker compose down`.
 
-The first successful collection registers each server and creates a **pending** baseline candidate. It does not trust that snapshot automatically. Approve one explicitly before drift comparisons can report clean or drifted results. For example:
+The Monitor loads explicit server identities, roles, display names, and private endpoints from `config/servers.json`. Its startup collection creates a **pending** baseline candidate for each newly enrolled server; it never trusts that snapshot automatically. Approve one explicitly before drift comparisons can report clean or drifted results. For example:
 
 ```bash
 candidate=$(curl -s http://localhost:8000/api/servers/server-03/baseline-candidates \
@@ -39,7 +39,11 @@ curl -X POST "http://localhost:8000/api/servers/server-03/baselines/$candidate/a
   -d '{"confirm":true,"approved_by":"demo-operator","reason":"Approved demo baseline"}'
 ```
 
-The supplied actor is audit metadata only; this project does not yet authenticate baseline approvers. Approve a candidate for each server you want assessed. `GET /api/scans?limit=20&offset=0` lists saved scans and `GET /api/scans/{scan_id}` returns a saved scan with its per-server baseline versions.
+The supplied actor is audit metadata only; this project does not yet authenticate baseline approvers. Approve a candidate for each server you want assessed. `GET /api/scans?limit=20&offset=0` lists saved scans and `GET /api/scans/{scan_id}` returns a saved scan with its per-server baseline versions. The Monitor performs a startup scan and then scans at `SCAN_INTERVAL_SECONDS` (default 60); on-demand `POST /api/scans` shares the same scan lock.
+
+Each server has its own named identity volume. The collector instance ID remains stable across a server restart; replacing the volume creates a different identity and the Monitor marks the mismatch instead of attaching the old baseline. The state endpoint returns only the versioned configuration contract. Collector identity, role, display name, and collector version travel in response headers and are checked against the declared registry. Collector endpoints are reachable only on the private Compose network. There is no per-caller collector authentication in this MVP: treat every workload attached to that network as trusted, and do not attach untrusted services or publish collector ports. Demo controls are separate allowlisted POST routes, disabled when `DEMO_MODE=false`.
+
+To add a server, add its declaration to `config/servers.json`, add its Compose service and a unique identity volume, then recreate the Monitor and new server. It enters the pending-baseline workflow after a successful collection. Before removing a server, call `POST /api/servers/{server_id}/decommission`; removing its registry entry without decommissioning leaves its inventory and history visible as not configured. A changed role or endpoint for an existing ID becomes an identity conflict; enroll a replacement under a new ID rather than reusing its baseline.
 
 ## Tests and local API
 
@@ -52,9 +56,9 @@ ruff check .
 ruff format --check backend fleet tests
 ```
 
-The Docker integration smoke test runs automatically when Docker Engine is reachable and Compose v2 are available. If the Docker CLI exists but the current user cannot access the daemon, pytest reports the integration test as skipped with that reason. To run only non-Docker tests, use `pytest -m 'not integration'`.
+The Docker integration smoke test runs automatically when Docker Engine is reachable and Compose v2 are available. It verifies all three collectors, explicit baseline approval, restart identity, persisted drift after a server restart, and inventory/baseline/scan history after Monitor restart. Its unique Compose project cleanup removes only its own resources. If the Docker CLI exists but the current user cannot access the daemon, pytest reports the integration test as skipped with that reason. To run only non-Docker tests, use `pytest -m 'not integration'`.
 
-`POST /api/scans` performs and persists an on-demand collection and detection pass. Scan history is available at `GET /api/scans` and `GET /api/scans/{scan_id}`. Alert lifecycle state, automatic scheduling, and AI explanations are later phases.
+`POST /api/scans` performs and persists an on-demand collection and detection pass. Scan history is available at `GET /api/scans` and `GET /api/scans/{scan_id}`. `GET /api/health` reports process health only; `GET /api/ready` checks local database readiness for Compose. The Monitor uses one Uvicorn worker while scheduling is enabled; startup fails clearly if `WEB_CONCURRENCY` requests multiple workers. Baseline approval has audit metadata but no real authentication in this MVP, and the frontend demo login is not authorization.
 
 ## Dashboard
 
@@ -88,11 +92,11 @@ SentinelOps/
 │       ├── services/api.js   HTTP calls to the FastAPI endpoints
 │       └── styles/           Page-specific styles
 ├── tests/                    Backend contract, API, detector and fleet tests
-├── docker-compose.yml        Three simulated servers and the backend
+├── docker-compose.yml        Monitor, three server roles, private network and volumes
 ├── pyproject.toml            Python dependencies and tool configuration
 └── README.md                 Setup, validation and run instructions
 ```
 
-The frontend is a client of the backend; it does not contain a second API server. Compose exposes only the backend on the host. The simulated servers stay on the internal Compose network.
+The frontend is a client of the Monitor; it does not contain a second API server. Compose publishes only the Monitor API on the host, bound to loopback by default. The monitored servers stay on the internal Compose network.
 
 For local backend development without the fleet, run `DATABASE_URL=sqlite:///./data/configguard.db uvicorn backend.app.main:app --host 127.0.0.1 --port 8000`. Fleet collection then needs server URLs supplied in `FLEET_SERVERS`.

@@ -6,7 +6,7 @@ WORKDIR /app
 
 COPY pyproject.toml README.md ./
 COPY backend ./backend
-COPY config/baseline.json config/policies.yaml ./config/
+COPY config/baseline.json config/policies.yaml config/servers.json ./config/
 RUN python -m pip install --no-cache-dir .
 
 RUN mkdir -p /data && chown 10001:10001 /data

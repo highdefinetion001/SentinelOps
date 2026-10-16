@@ -13,10 +13,12 @@ x-simulated-server: &simulated-server
     - ALL
   security_opt:
     - no-new-privileges:true
+  cpus: 0.50
+  mem_limit: 256m
   expose:
     - "8080"
   networks:
-    - fleet
+    - monitoring
   healthcheck:
     test:
       - CMD
@@ -33,63 +35,89 @@ services:
     <<: *simulated-server
     environment:
       SERVER_ID: server-01
+      SERVER_DISPLAY_NAME: Checkout Web
+      SERVER_ROLE: web
+      SERVER_IDENTITY_FILE: /var/lib/configguard/instance-id
       SERVER_CONFIG: /app/fleet/server_configs/server-01.json
       DEMO_MODE: "${DEMO_MODE:-false}"
+    volumes:
+      - server_01_identity:/var/lib/configguard
 
   server-02:
     <<: *simulated-server
     environment:
       SERVER_ID: server-02
+      SERVER_DISPLAY_NAME: Checkout Application
+      SERVER_ROLE: application
+      SERVER_IDENTITY_FILE: /var/lib/configguard/instance-id
       SERVER_CONFIG: /app/fleet/server_configs/server-02.json
       DEMO_MODE: "${DEMO_MODE:-false}"
+    volumes:
+      - server_02_identity:/var/lib/configguard
 
   server-03:
     <<: *simulated-server
     environment:
       SERVER_ID: server-03
+      SERVER_DISPLAY_NAME: Checkout Database
+      SERVER_ROLE: database
+      SERVER_IDENTITY_FILE: /var/lib/configguard/instance-id
       SERVER_CONFIG: /app/fleet/server_configs/server-03.json
       DEMO_MODE: "${DEMO_MODE:-false}"
+    volumes:
+      - server_03_identity:/var/lib/configguard
 
-  backend:
-    image: configguard-backend:local
+  monitor:
+    image: configguard-monitor:local
     build:
       context: .
       dockerfile: backend/Dockerfile
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    cpus: 1.00
+    mem_limit: 512m
     environment:
       APP_ENV: "${APP_ENV:-development}"
       API_HOST: 0.0.0.0
       API_PORT: 8000
       DEMO_MODE: "${DEMO_MODE:-false}"
       DATABASE_URL: "${DATABASE_URL:-sqlite:////data/configguard.db}"
-      FLEET_SERVERS: "${FLEET_SERVERS:-server-01=http://server-01:8080,server-02=http://server-02:8080,server-03=http://server-03:8080}"
+      SERVER_REGISTRY_FILE: /app/config/servers.json
+      SCAN_INTERVAL_SECONDS: "${SCAN_INTERVAL_SECONDS:-60}"
+      MONITOR_SCHEDULER_ENABLED: "${MONITOR_SCHEDULER_ENABLED:-true}"
     volumes:
       - configguard_data:/data
     ports:
       - "${API_HOST:-127.0.0.1}:${API_PORT:-8000}:8000"
     networks:
-      - fleet
+      - monitoring
       - api
     depends_on:
       server-01:
-        condition: service_healthy
+        condition: service_started
       server-02:
-        condition: service_healthy
+        condition: service_started
       server-03:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test:
         - CMD
         - python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=2)"
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/ready', timeout=2)"
       interval: 5s
       timeout: 3s
       retries: 10
       start_period: 5s
 
 networks:
-  fleet:
+  monitoring:
     driver: bridge
     internal: true
   api:
@@ -97,3 +125,6 @@ networks:
 
 volumes:
   configguard_data:
+  server_01_identity:
+  server_02_identity:
+  server_03_identity:

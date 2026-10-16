@@ -5,9 +5,9 @@
   "config_version": "v1",
   "config": {
     "debug_mode": false,
-    "max_connections": 200,
+    "max_connections": 500,
     "log_level": "INFO",
-    "tls_min_version": "TLS1.2"
+    "tls_min_version": "TLS1.3"
   },
   "environment": {
     "runtime_version": "3.12",

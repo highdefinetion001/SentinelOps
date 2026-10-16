@@ -1,0 +1,22 @@
+{
+  "servers": [
+    {
+      "server_id": "server-01",
+      "display_name": "Checkout Web",
+      "role": "web",
+      "endpoint": "http://server-01:8080"
+    },
+    {
+      "server_id": "server-02",
+      "display_name": "Checkout Application",
+      "role": "application",
+      "endpoint": "http://server-02:8080"
+    },
+    {
+      "server_id": "server-03",
+      "display_name": "Checkout Database",
+      "role": "database",
+      "endpoint": "http://server-03:8080"
+    }
+  ]
+}

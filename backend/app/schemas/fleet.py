@@ -18,6 +18,7 @@ class CollectionFailure(FleetModel):
         "http_error",
         "invalid_json",
         "invalid_state",
+        "response_too_large",
         "identity_conflict",
         "unreachable",
         "request_error",
@@ -32,6 +33,10 @@ class ServerCollection(FleetModel):
     status: Literal["success", "failed"]
     fingerprint: str | None = None
     state: ServerStateV1 | None = None
+    display_name: str | None = None
+    role: str | None = None
+    collector_version: str | None = None
+    instance_id: str | None = Field(default=None, exclude=True)
     error: CollectionFailure | None = None
 
 

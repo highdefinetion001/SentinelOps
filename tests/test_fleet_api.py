@@ -35,6 +35,8 @@ def server_state(server_id: str, config: dict[str, object] | None = None) -> dic
 @pytest.fixture(autouse=True)
 def isolated_database(tmp_path, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'api.db'}")
+    monkeypatch.setenv("MONITOR_SCHEDULER_ENABLED", "false")
+    monkeypatch.setenv("MONITOR_SCHEDULER_ENABLED", "false")
 
 
 def test_fleet_states_endpoint_returns_success_and_partial_failure() -> None:
