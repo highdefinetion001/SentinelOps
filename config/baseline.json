@@ -1,0 +1,10 @@
+{
+  "baseline_id": "checkout-production",
+  "service_group": "checkout-api",
+  "baseline_version": "1",
+  "schema_version": "1.0",
+  "approval": {"approved_by": "platform-team", "approved_at": "2026-10-16T00:00:00Z", "change_reference": "FOUNDATION-001"},
+  "expected_config": {"debug_mode": false, "max_connections": 200, "log_level": "INFO", "tls_min_version": "TLS1.2"},
+  "expected_environment": {"runtime_version": "3.12", "app_version": "1.4.0"},
+  "policy_version": "1.0"
+}

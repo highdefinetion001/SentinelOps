@@ -1,0 +1,93 @@
+name: configguard-ai
+
+x-simulated-server: &simulated-server
+  image: configguard-fleet:local
+  build:
+    context: .
+    dockerfile: fleet/Dockerfile
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  expose:
+    - "8080"
+  networks:
+    - fleet
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)"
+    interval: 5s
+    timeout: 3s
+    retries: 10
+    start_period: 5s
+
+services:
+  server-01:
+    <<: *simulated-server
+    environment:
+      SERVER_ID: server-01
+      SERVER_CONFIG: /app/fleet/server_configs/server-01.json
+      DEMO_MODE: "${DEMO_MODE:-false}"
+
+  server-02:
+    <<: *simulated-server
+    environment:
+      SERVER_ID: server-02
+      SERVER_CONFIG: /app/fleet/server_configs/server-02.json
+      DEMO_MODE: "${DEMO_MODE:-false}"
+
+  server-03:
+    <<: *simulated-server
+    environment:
+      SERVER_ID: server-03
+      SERVER_CONFIG: /app/fleet/server_configs/server-03.json
+      DEMO_MODE: "${DEMO_MODE:-false}"
+
+  backend:
+    image: configguard-backend:local
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    environment:
+      APP_ENV: "${APP_ENV:-development}"
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      DEMO_MODE: "${DEMO_MODE:-false}"
+      FLEET_SERVERS: "${FLEET_SERVERS:-server-01=http://server-01:8080,server-02=http://server-02:8080,server-03=http://server-03:8080}"
+    ports:
+      - "${API_HOST:-127.0.0.1}:${API_PORT:-8000}:8000"
+    networks:
+      - fleet
+      - api
+    depends_on:
+      server-01:
+        condition: service_healthy
+      server-02:
+        condition: service_healthy
+      server-03:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=2)"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+networks:
+  fleet:
+    driver: bridge
+    internal: true
+  api:
+    driver: bridge

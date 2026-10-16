@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://configguard.invalid/schemas/server-state-1.0.json",
+  "title": "ConfigGuard AI Server State 1.0",
+  "description": "Reported state; config and environment are fingerprinted, collected_at is volatile.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "server_id", "service", "config_version", "config", "environment", "collected_at"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "server_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"},
+    "service": {"type": "string", "minLength": 1, "maxLength": 128},
+    "config_version": {"type": "string", "minLength": 1, "maxLength": 64},
+    "config": {"type": "object", "additionalProperties": false, "required": ["debug_mode", "max_connections", "log_level", "tls_min_version"], "properties": {
+      "debug_mode": {"type": "boolean"}, "max_connections": {"type": "integer", "minimum": 1, "maximum": 100000},
+      "log_level": {"enum": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]}, "tls_min_version": {"enum": ["TLS1.2", "TLS1.3"]}
+    }},
+    "environment": {"type": "object", "additionalProperties": false, "required": ["runtime_version", "app_version"], "properties": {
+      "runtime_version": {"type": "string", "minLength": 1, "maxLength": 64}, "app_version": {"type": "string", "minLength": 1, "maxLength": 64}
+    }},
+    "collected_at": {"type": "string", "format": "date-time"}
+  }
+}

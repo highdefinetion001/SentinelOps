@@ -1,0 +1,43 @@
+policy_version: "1.0"
+applies_to:
+  service_group: checkout-api
+severity_categories:
+  INFO: "Informational deviation with no identified operational impact."
+  LOW: "Limited impact, such as a non-sensitive log verbosity change."
+  MEDIUM: "Meaningful reliability or observability risk needing review."
+  HIGH: "Material security or availability exposure requiring prompt action."
+  CRITICAL: "Immediate severe exposure, such as debug mode enabled in production."
+severity_defaults:
+  changed_value: LOW
+  missing_field: HIGH
+  unexpected_field: MEDIUM
+  peer_outlier: INFO
+rules:
+  - id: prod-debug-disabled
+    field: config.debug_mode
+    operator: equals
+    value: false
+    severity: CRITICAL
+    context: production
+  - id: tls-minimum
+    field: config.tls_min_version
+    operator: at_least
+    value: TLS1.2
+    severity: HIGH
+  - id: connection-pool-range
+    field: config.max_connections
+    operator: range
+    minimum: 20
+    maximum: 1000
+    severity: MEDIUM
+  - id: runtime-approved
+    field: environment.runtime_version
+    operator: in
+    values: ["3.11", "3.12"]
+    severity: HIGH
+  - id: log-level-approved
+    field: config.log_level
+    operator: in
+    values: ["INFO", "WARNING", "ERROR"]
+    severity: LOW
+unknown_fields: reject
