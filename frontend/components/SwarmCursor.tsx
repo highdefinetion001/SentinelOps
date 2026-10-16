@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, type CSSProperties, type HTMLAttributes, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, type CSSProperties, type HTMLAttributes, type ReactNode } from 'react';
 
 export type SwarmShape = 'dot' | 'streak' | 'square';
 export type SwarmIdle = 'roam' | 'gather' | 'hide';
@@ -227,7 +227,7 @@ const SwarmCursor = ({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wakeRef = useRef<(() => void) | null>(null);
   const ink = lightMode ? '#18181b' : '#ffffff';
-  const settings: Settings = {
+  const settings = useMemo<Settings>(() => ({
     count: Math.round(clamp(count, 1, MAX_PARTICLES)),
     size: clamp(size, 0.5, 16),
     shape: SHAPES[shape] ?? 0,
@@ -248,9 +248,11 @@ const SwarmCursor = ({
     enabled,
     lightMode,
     dpr
-  };
+  }), [count, size, shape, color, accentColor, spread, speed, swirl, tail, trail, wander, depth, targets, idle, clickEffect, hideCursor, intro, enabled, lightMode, dpr, ink]);
   const settingsRef = useRef(settings);
-  settingsRef.current = settings;
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
 
   useEffect(() => {
     const container = containerRef.current;

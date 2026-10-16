@@ -1,16 +1,12 @@
 'use client';
 
 import { useTheme } from 'next-themes';
-import { useEffect, useState, MouseEvent } from 'react';
+import { useSyncExternalStore, type MouseEvent } from 'react';
 import { Sun, Moon } from 'lucide-react';
 
 export default function ThemeToggle() {
   const { resolvedTheme, setTheme } = useTheme();
-  const [mounted, setMounted] = useState(false);
-
-  useEffect(() => {
-    setMounted(true);
-  }, []);
+  const mounted = useSyncExternalStore(() => () => {}, () => true, () => false);
 
   if (!mounted) {
     return <div className="w-8 h-8 rounded-xl bg-muted/40 animate-pulse" />;
@@ -19,7 +15,7 @@ export default function ThemeToggle() {
   const isDark = resolvedTheme === 'dark';
 
   const toggleTheme = (e: MouseEvent<HTMLButtonElement>) => {
-    const nextTheme = isDark ? 'mgmu' : 'dark';
+    const nextTheme = isDark ? 'light' : 'dark';
     if (!document.startViewTransition) {
       setTheme(nextTheme);
       return;

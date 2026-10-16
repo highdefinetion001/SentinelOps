@@ -112,6 +112,7 @@ class ReadyResponse(BaseModel):
     status: str
     database: str
     registered_servers: int
+    demo_controls_enabled: bool
 
 
 class _DriftAcknowledgement(BaseModel):
@@ -310,6 +311,7 @@ async def readiness(
             status="ready",
             database="ready",
             registered_servers=len(database.list_servers(limit=10000)),
+            demo_controls_enabled=demo_controls_enabled(),
         )
     except sqlite3.Error as exc:
         raise _storage_error() from exc

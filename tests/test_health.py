@@ -21,12 +21,26 @@ def test_health_reports_application_without_claiming_dependency_readiness() -> N
 def test_readiness_checks_sqlite_without_changing_health_contract(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'ready.db'}")
     monkeypatch.setenv("MONITOR_SCHEDULER_ENABLED", "false")
+    monkeypatch.setenv("DEMO_MODE", "false")
     with TestClient(app) as client:
         health = client.get("/api/health")
         ready = client.get("/api/ready")
     assert health.json()["dependencies_checked"] is False
     assert ready.status_code == 200
     assert ready.json()["database"] == "ready"
+    assert ready.json()["demo_controls_enabled"] is False
+
+
+def test_readiness_reports_demo_controls_setting_without_changing_health(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'demo-ready.db'}")
+    monkeypatch.setenv("MONITOR_SCHEDULER_ENABLED", "false")
+    monkeypatch.setenv("DEMO_MODE", "true")
+    with TestClient(app) as client:
+        ready = client.get("/api/ready")
+    assert ready.status_code == 200
+    assert ready.json()["demo_controls_enabled"] is True
 
 
 def test_health_stays_responsive_while_startup_scan_is_running(tmp_path, monkeypatch) -> None:
